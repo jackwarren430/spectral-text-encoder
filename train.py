@@ -64,6 +64,11 @@ def run_check(cfg: Config):
     phi = torch.gather(phi, -1, perm)
     signal = synthesize(A, f, phi, cfg.n_samples, cfg.duration)
     A_hat, f_hat, phi_hat = fft_peaks(signal, cfg.seq_len, cfg.duration)
+    # fft_peaks returns magnitude-sorted; for element-wise comparison against
+    # the frequency-sorted ground truth, sort recovered tuples by f̂ here.
+    f_hat, sort_idx = torch.sort(f_hat, dim=-1, stable=True)
+    A_hat = torch.gather(A_hat, -1, sort_idx)
+    phi_hat = torch.gather(phi_hat, -1, sort_idx)
     df = (f_hat - f).abs()
     dA = (A_hat - A).abs() / A.abs().clamp(min=1e-6)
     # phase wrap-aware diff

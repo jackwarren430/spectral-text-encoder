@@ -16,7 +16,8 @@ class Config:
     n_heads: int = 4
     ffn_dim: int = 1024
     dropout: float = 0.1
-    decoder_hidden: int = 512
+    decoder_hidden: int = 256
+    decoder_layers: int = 2
 
     # signal / FFT
     n_samples: int = 1024

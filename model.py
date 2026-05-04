@@ -24,11 +24,11 @@ class SpectralEncoder(nn.Module):
         self.encoder = nn.TransformerEncoder(layer, num_layers=cfg.n_layers)
         self.head = nn.Sequential(
             nn.LayerNorm(cfg.d_model),
-            nn.Linear(cfg.d_model, cfg.d_model/2),
+            nn.Linear(cfg.d_model, cfg.d_model),
             nn.GELU(),
-            nn.Linear(cfg.d_model/2, cfg.d_model/4),
+            nn.Linear(cfg.d_model, cfg.d_model),
             nn.GELU(),
-            nn.Linear(cfg.d_model/4, 3)
+            nn.Linear(cfg.d_model, 3)
         )
 
     def forward(self, tokens):
@@ -41,11 +41,7 @@ class SpectralEncoder(nn.Module):
         A = F.softplus(raw_A)
         f = cfg.f_min + (cfg.f_max - cfg.f_min) * torch.sigmoid(raw_f)
         phi = 2 * math.pi * torch.sigmoid(raw_phi)
-        # sort by frequency along L for canonical ordering
-        f_sorted, perm = torch.sort(f, dim=-1, stable=True)
-        A_sorted = torch.gather(A, -1, perm)
-        phi_sorted = torch.gather(phi, -1, perm)
-        return A_sorted, f_sorted, phi_sorted, perm
+        return A, f, phi
 
 
 def synthesize(A, f, phi, n_samples: int, duration: float):
@@ -62,11 +58,11 @@ def synthesize(A, f, phi, n_samples: int, duration: float):
 
 
 def fft_peaks(signal, n_peaks: int, duration: float, eps: float = 1e-10):
-    """Window+rFFT, take top-K bins (excluding DC), parabolic-interp the
-    sub-bin frequency, recover (Â, f̂, φ̂).
+    """Window+rFFT, take top-K local-maxima bins (excluding DC), parabolic-interp
+    the sub-bin frequency, recover (Â, f̂, φ̂).
 
     signal: (B, N). Returns A_hat, f_hat, phi_hat, each (B, n_peaks).
-    Outputs are sorted by ascending f̂.
+    Outputs are ordered by descending magnitude (largest peak first).
     """
     B, N = signal.shape
     device = signal.device
@@ -105,10 +101,8 @@ def fft_peaks(signal, n_peaks: int, duration: float, eps: float = 1e-10):
     phi_hat = torch.atan2(imag, real) + math.pi / 2
     phi_hat = (phi_hat + 2 * math.pi) % (2 * math.pi)
 
-    # sort by f̂
-    f_hat, sort_idx = torch.sort(f_hat, dim=-1, stable=True)
-    A_hat = torch.gather(A_hat, -1, sort_idx)
-    phi_hat = torch.gather(phi_hat, -1, sort_idx)
+    # topk already returns indices ordered by descending magnitude, so the
+    # outputs are magnitude-sorted (largest peak first) without further work.
     return A_hat, f_hat, phi_hat
 
 
@@ -117,6 +111,7 @@ class ParamDecoder(nn.Module):
         super().__init__()
         self.cfg = cfg
         in_dim = 4  # Â, f̂_norm, sin φ̂, cos φ̂
+
         self.net = nn.Sequential(
             nn.Linear(in_dim, cfg.decoder_hidden),
             nn.GELU(),
@@ -125,11 +120,31 @@ class ParamDecoder(nn.Module):
             nn.Linear(cfg.decoder_hidden, cfg.d_model),
         )
 
+        # Learned positional queries, one per output slot. Slot i is meant to
+        # reconstruct the i-th original token; the transformer cross-attends
+        # to the magnitude-sorted peak features to pull whatever it needs.
+        self.queries = nn.Parameter(torch.zeros(1, cfg.seq_len, cfg.d_model))
+        nn.init.normal_(self.queries, std=0.02)
+
+        dec_layer = nn.TransformerDecoderLayer(
+            d_model=cfg.d_model,
+            nhead=cfg.n_heads,
+            dim_feedforward=cfg.ffn_dim,
+            dropout=cfg.dropout,
+            activation="gelu",
+            batch_first=True,
+            norm_first=True,
+        )
+        self.transformer = nn.TransformerDecoder(dec_layer, num_layers=cfg.decoder_layers)
+
     def forward(self, A_hat, f_hat, phi_hat):
         cfg = self.cfg
         f_norm = (f_hat - cfg.f_min) / (cfg.f_max - cfg.f_min)
         feats = torch.stack([A_hat, f_norm, torch.sin(phi_hat), torch.cos(phi_hat)], dim=-1)
-        return self.net(feats)  # (B, L, d_model)
+        memory = self.net(feats)  # (B, L, d_model), magnitude-sorted peak features
+        B = memory.size(0)
+        queries = self.queries.expand(B, -1, -1)
+        return self.transformer(queries, memory)  # (B, L, d_model)
 
 
 class SpectralAE(nn.Module):
@@ -141,12 +156,10 @@ class SpectralAE(nn.Module):
 
     def forward(self, tokens):
         cfg = self.cfg
-        A, f, phi, perm = self.encoder(tokens)
+        A, f, phi = self.encoder(tokens)
         signal = synthesize(A, f, phi, cfg.n_samples, cfg.duration)
         A_hat, f_hat, phi_hat = fft_peaks(signal, cfg.seq_len, cfg.duration)
         decoded_emb = self.decoder(A_hat, f_hat, phi_hat)  # (B, L, d_model)
         # tied output projection
         logits = decoded_emb @ self.encoder.token_emb.weight.T  # (B, L, V)
-        # reorder targets to match the encoder-side sort by predicted f
-        sorted_tokens = torch.gather(tokens, -1, perm)
-        return logits, sorted_tokens
+        return logits, tokens
