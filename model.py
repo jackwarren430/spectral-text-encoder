@@ -30,6 +30,12 @@ class SpectralEncoder(nn.Module):
             nn.GELU(),
             nn.Linear(cfg.d_model, 3)
         )
+        # Per-position pre-sigmoid bias on the f channel. Linspace gives an
+        # initial frequency spread across [f_min, f_max] so peaks don't all
+        # collapse onto a single bin at step 0.
+        self.f_pos_bias = nn.Parameter(
+            torch.linspace(-cfg.f_bias_spread, cfg.f_bias_spread, cfg.seq_len).view(1, -1)
+        )
 
     def forward(self, tokens):
         # tokens: (B, L)
@@ -38,8 +44,8 @@ class SpectralEncoder(nn.Module):
         raw = self.head(h)  # (B, L, 3)
         raw_A, raw_f, raw_phi = raw.unbind(-1)
         cfg = self.cfg
-        A = F.softplus(raw_A)
-        f = cfg.f_min + (cfg.f_max - cfg.f_min) * torch.sigmoid(raw_f)
+        A = F.softplus(raw_A).clamp(max=cfg.A_max)
+        f = cfg.f_min + (cfg.f_max - cfg.f_min) * torch.sigmoid(raw_f + self.f_pos_bias)
         phi = 2 * math.pi * torch.sigmoid(raw_phi)
         return A, f, phi
 
@@ -86,7 +92,11 @@ def fft_peaks(signal, n_peaks: int, duration: float, eps: float = 1e-10):
     b = torch.gather(log_mag, -1, topk_idx_d)
     c = torch.gather(log_mag, -1, right_idx)
     denom = a - 2 * b + c
-    delta = torch.where(denom.abs() > 1e-8, 0.5 * (a - c) / denom, torch.zeros_like(denom))
+    # Gradient-safe division: sanitize the denominator BEFORE dividing so
+    # autograd never propagates through a 1/0 in the unselected branch.
+    denom_ok = denom.abs() > 1e-8
+    safe_denom = torch.where(denom_ok, denom, torch.ones_like(denom))
+    delta = torch.where(denom_ok, 0.5 * (a - c) / safe_denom, torch.zeros_like(denom))
     delta = delta.clamp(-0.5, 0.5)
     # zero delta at boundary bins
     boundary = (topk_idx_d == 0) | (topk_idx_d == M - 1)
@@ -95,10 +105,12 @@ def fft_peaks(signal, n_peaks: int, duration: float, eps: float = 1e-10):
     f_hat = (topk_idx_d.to(signal.dtype) + delta) / duration
     # amplitude: peak-amp of windowed sine ≈ |X[k]| * 2 / window.sum()
     A_hat = torch.gather(mag, -1, topk_idx_d) * (2.0 / win_sum)
-    # phase: angle of X at peak; sin convention shifts cos-phase by -π/2
+    # phase: angle of X at peak; sin convention shifts cos-phase by π/2.
+    # Sub-bin correction: a sine at bin k+δ produces a linear phase ramp of
+    # roughly π·δ at the integer bin k, so subtract it back out.
     real = torch.gather(X.real, -1, topk_idx_d)
     imag = torch.gather(X.imag, -1, topk_idx_d)
-    phi_hat = torch.atan2(imag, real) + math.pi / 2
+    phi_hat = torch.atan2(imag, real) + math.pi / 2 - math.pi * delta
     phi_hat = (phi_hat + 2 * math.pi) % (2 * math.pi)
 
     # topk already returns indices ordered by descending magnitude, so the
@@ -106,11 +118,36 @@ def fft_peaks(signal, n_peaks: int, duration: float, eps: float = 1e-10):
     return A_hat, f_hat, phi_hat
 
 
+def fourier_features(x, K: int):
+    """NeRF-style multi-scale sin/cos expansion of a low-dim input.
+
+    x: (..., D). Returns (..., D * 2 * K) by stacking [sin(2^k π x), cos(2^k π x)]
+    for k = 0..K-1.
+    """
+    bands = (2.0 ** torch.arange(K, device=x.device, dtype=x.dtype)) * math.pi
+    args = x.unsqueeze(-1) * bands  # (..., D, K)
+    feats = torch.cat([args.sin(), args.cos()], dim=-1)  # (..., D, 2K)
+    return feats.flatten(-2)  # (..., D*2K)
+
+
+def freq_separation_loss(f, min_sep: float):
+    """Hinge penalty on too-close pairs of predicted frequencies.
+
+    f: (B, L). Returns a scalar averaged over off-diagonal pairs and batch.
+    """
+    diff = (f.unsqueeze(-1) - f.unsqueeze(-2)).abs()  # (B, L, L)
+    L = f.size(-1)
+    eye = torch.eye(L, dtype=torch.bool, device=f.device)
+    penalty = torch.relu(min_sep - diff).masked_fill(eye, 0.0)
+    return penalty.sum() / (f.size(0) * L * (L - 1))
+
+
 class ParamDecoder(nn.Module):
     def __init__(self, cfg):
         super().__init__()
         self.cfg = cfg
-        in_dim = 4  # Â, f̂_norm, sin φ̂, cos φ̂
+        # 4 base scalars (Â, f̂_norm, sin φ̂, cos φ̂) lifted via Fourier features
+        in_dim = 4 * 2 * cfg.fourier_K
 
         self.net = nn.Sequential(
             nn.Linear(in_dim, cfg.decoder_hidden),
@@ -140,7 +177,8 @@ class ParamDecoder(nn.Module):
     def forward(self, A_hat, f_hat, phi_hat):
         cfg = self.cfg
         f_norm = (f_hat - cfg.f_min) / (cfg.f_max - cfg.f_min)
-        feats = torch.stack([A_hat, f_norm, torch.sin(phi_hat), torch.cos(phi_hat)], dim=-1)
+        base = torch.stack([A_hat, f_norm, torch.sin(phi_hat), torch.cos(phi_hat)], dim=-1)
+        feats = fourier_features(base, cfg.fourier_K)
         memory = self.net(feats)  # (B, L, d_model), magnitude-sorted peak features
         B = memory.size(0)
         queries = self.queries.expand(B, -1, -1)
@@ -162,4 +200,7 @@ class SpectralAE(nn.Module):
         decoded_emb = self.decoder(A_hat, f_hat, phi_hat)  # (B, L, d_model)
         # tied output projection
         logits = decoded_emb @ self.encoder.token_emb.weight.T  # (B, L, V)
-        return logits, tokens
+        # frequency-separation auxiliary penalty (in Hz; min_sep_bins · Δf)
+        min_sep = cfg.freq_sep_min_bins / cfg.duration
+        aux = freq_separation_loss(f, min_sep)
+        return logits, tokens, aux

@@ -37,7 +37,7 @@ def validate(model, loader, device, max_batches: int):
         if i >= max_batches:
             break
         batch = batch.to(device)
-        logits, targets = model(batch)
+        logits, targets, _aux = model(batch)
         loss = F.cross_entropy(logits.flatten(0, 1), targets.flatten(0, 1))
         total_loss += loss.item() * targets.numel()
         total_correct += (logits.argmax(-1) == targets).sum().item()
@@ -98,6 +98,7 @@ def train(cfg: Config):
     step = 0
     t0 = time.time()
     running_loss = 0.0
+    running_aux = 0.0
     running_correct = 0
     running_count = 0
     train_iter = iter(train_loader)
@@ -108,29 +109,38 @@ def train(cfg: Config):
             train_iter = iter(train_loader)
             batch = next(train_iter)
         batch = batch.to(device)
-        logits, targets = model(batch)
-        loss = F.cross_entropy(logits.flatten(0, 1), targets.flatten(0, 1))
+        logits, targets, aux = model(batch)
+        ce = F.cross_entropy(logits.flatten(0, 1), targets.flatten(0, 1))
+        loss = ce + cfg.freq_sep_lambda * aux
+        if not torch.isfinite(loss):
+            print(f"step {step+1:6d}: non-finite loss ({loss.item()}); skipping batch")
+            opt.zero_grad(set_to_none=True)
+            step += 1
+            continue
         opt.zero_grad(set_to_none=True)
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)
         opt.step()
         sched.step()
 
-        running_loss += loss.item() * targets.numel()
+        running_loss += ce.item() * targets.numel()
+        running_aux += aux.item()
         running_correct += (logits.argmax(-1) == targets).sum().item()
         running_count += targets.numel()
         step += 1
 
         if step % cfg.log_every == 0:
             avg_loss = running_loss / running_count
+            avg_aux = running_aux / cfg.log_every
             acc = running_correct / running_count
             dt = time.time() - t0
             lr_now = sched.get_last_lr()[0]
             print(
-                f"step {step:6d} | loss {avg_loss:7.4f} | acc {acc*100:5.2f}% | "
-                f"lr {lr_now:.2e} | {dt/cfg.log_every*1000:.0f}ms/step"
+                f"step {step:6d} | ce {avg_loss:7.4f} | aux {avg_aux:6.3f} | "
+                f"acc {acc*100:5.2f}% | lr {lr_now:.2e} | {dt/cfg.log_every*1000:.0f}ms/step"
             )
-            running_loss = running_correct = running_count = 0
+            running_loss = running_aux = 0.0
+            running_correct = running_count = 0
             t0 = time.time()
 
         if step % cfg.val_every == 0:

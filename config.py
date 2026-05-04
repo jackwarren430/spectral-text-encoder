@@ -12,24 +12,35 @@ class Config:
 
     # model
     d_model: int = 256
-    n_layers: int = 4
+    n_layers: int = 6
     n_heads: int = 4
-    ffn_dim: int = 1024
-    dropout: float = 0.1
+    ffn_dim: int = 2048
+    dropout: float = 0.0
     decoder_hidden: int = 256
     decoder_layers: int = 2
+    fourier_K: int = 6  # bands for decoder Fourier-feature encoding
 
     # signal / FFT
-    n_samples: int = 1024
+    n_samples: int = 2048
     duration: float = 1.0
     f_min: float = 1.0
-    f_max: float = 480.0  # Nyquist = n_samples / (2*duration) = 512; leave margin
+    f_max: float = 960.0  # Nyquist = n_samples / (2*duration) = 1024; leave margin
+
+    # encoder f-head init: per-position bias spread (in pre-sigmoid space)
+    f_bias_spread: float = 3.0
+
+    # amplitude cap (softplus(raw_A).clamp(max=...)) to prevent runaway
+    A_max: float = 10.0
+
+    # frequency-separation auxiliary loss
+    freq_sep_min_bins: float = 4.0  # main-lobe width for Hann ≈ 4 bins
+    freq_sep_lambda: float = 1e-3
 
     # training
-    batch_size: int = 32
+    batch_size: int = 64
     lr: float = 3e-4
     weight_decay: float = 0.01
-    warmup_steps: int = 500
+    warmup_steps: int = 1500
     max_steps: int = 20000
     grad_clip: float = 1.0
     log_every: int = 50
