@@ -8,7 +8,7 @@ import torch.nn.functional as F
 from torch.optim import AdamW
 
 from config import Config
-from model import SpectralAE, fft_peaks, synthesize
+from model import SpectralAE
 
 
 def lr_lambda(step, cfg: Config):
@@ -44,38 +44,6 @@ def validate(model, loader, device, max_batches: int):
         total_count += targets.numel()
     model.train()
     return total_loss / max(1, total_count), total_correct / max(1, total_count)
-
-
-def run_check(cfg: Config):
-    """Sanity test: synthesize known waves, recover via fft_peaks."""
-    device = pick_device(cfg.device)
-    torch.manual_seed(0)
-    B, L = 4, cfg.seq_len
-    A = torch.rand(B, L, device=device) * 0.8 + 0.2
-    # spread frequencies at least 2 Hz apart, well within [f_min, f_max]
-    base = torch.linspace(cfg.f_min + 5, cfg.f_max - 5, L, device=device)
-    f = base.unsqueeze(0).expand(B, L).contiguous()
-    f = f + torch.randn_like(f) * 0.5
-    f = f.clamp(cfg.f_min + 1, cfg.f_max - 1)
-    phi = torch.rand(B, L, device=device) * 2 * math.pi
-    # sort inputs so order matches output ordering
-    f, perm = torch.sort(f, dim=-1)
-    A = torch.gather(A, -1, perm)
-    phi = torch.gather(phi, -1, perm)
-    signal = synthesize(A, f, phi, cfg.n_samples, cfg.duration)
-    A_hat, f_hat, phi_hat = fft_peaks(signal, cfg.seq_len, cfg.duration)
-    # fft_peaks returns magnitude-sorted; for element-wise comparison against
-    # the frequency-sorted ground truth, sort recovered tuples by f̂ here.
-    f_hat, sort_idx = torch.sort(f_hat, dim=-1, stable=True)
-    A_hat = torch.gather(A_hat, -1, sort_idx)
-    phi_hat = torch.gather(phi_hat, -1, sort_idx)
-    df = (f_hat - f).abs()
-    dA = (A_hat - A).abs() / A.abs().clamp(min=1e-6)
-    # phase wrap-aware diff
-    dphi = (phi_hat - phi + math.pi) % (2 * math.pi) - math.pi
-    print("[check] freq mean abs err:", df.mean().item(), "max:", df.max().item())
-    print("[check] amp mean rel err:", dA.mean().item(), "max:", dA.max().item())
-    print("[check] phase mean abs err (rad):", dphi.abs().mean().item())
 
 
 def train(cfg: Config):
@@ -155,7 +123,6 @@ def train(cfg: Config):
 
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument("--check", action="store_true", help="run FFT round-trip sanity test and exit")
     p.add_argument("--device", default=None)
     p.add_argument("--seq-len", type=int, default=None)
     p.add_argument("--n-samples", type=int, default=None)
@@ -176,9 +143,6 @@ def main():
     if args.max_steps:
         cfg.max_steps = args.max_steps
 
-    if args.check:
-        run_check(cfg)
-        return
     train(cfg)
 
 
