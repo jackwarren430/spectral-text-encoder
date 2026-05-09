@@ -179,6 +179,9 @@ def train(cfg: Config, run_dir: str, resume_ckpt: str | None):
             step += 1
             pbar.update(1)
 
+            if device == "mps" and step % 200 == 0:
+                torch.mps.empty_cache()
+
             if step % cfg.clip_log_every == 0:
                 avg_loss = running_loss / running_total
                 acc = running_correct / running_total

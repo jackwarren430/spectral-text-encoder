@@ -11,16 +11,16 @@ class Config:
     dataset_config: str = "wikitext-103-raw-v1"
 
     # model
-    d_model: int = 256
+    d_model: int = 512
     n_layers: int = 8
-    n_heads: int = 4
+    n_heads: int = 8
     ffn_dim: int = 2048
     dropout: float = 0.0
     decoder_layers: int = 6
     # per-token sine-wave channel count: each of the L encoder slots emits
     # d_sine independent (A, f, φ) triples. The decoder consumes the summed
     # multi-channel waveform directly (no FFT round-trip).
-    d_sine: int = 3
+    d_sine: int = 4
 
     # signal / FFT
     n_samples: int = 2048
@@ -56,22 +56,22 @@ class Config:
     clip_dataset_config: str = "pair"
     clip_max_len: int = 128  # truncate longer sentences (GPT-2 BPE tokens)
     clip_val_frac: float = 0.05  # last 5% of train held out as validation
-    clip_batch_size: int = 64
+    clip_batch_size: int = 128
     # Gradient accumulation: each optimizer step backpropagates the average over
     # this many mini-batches. Smooths gradient direction estimates without
     # raising peak memory. Note: this does NOT give more in-batch negatives —
     # each mini-batch still computes its loss against its own (B-1) negatives.
-    clip_grad_accum_steps: int = 4
+    clip_grad_accum_steps: int = 1
     clip_lr: float = 1e-4
-    clip_warmup_steps: int = 1000
-    clip_max_steps: int = 20000
-    clip_logit_scale_init: float = 2.6593  # ln(1/0.07) — CLIP default
+    clip_warmup_steps: int = 3000
+    clip_max_steps: int = 100000
+    clip_logit_scale_init: float = 2.6593 # ln(1/0.07) — CLIP default
     clip_logit_scale_max: float = 4.6052  # ln(100) — clamp ceiling per CLIP
-    clip_log_every: int = 50
+    clip_log_every: int = 100
     clip_val_every: int = 1000
     clip_val_batches: int = 50
     clip_ckpt_every: int = 2000
-    clip_ckpt_dir: str = "all-training/clip_checkpoints"
+    clip_ckpt_dir: str = "all-training/clip_large_model_long_2"
 
     # runtime
     device: str = "mps"
