@@ -12,10 +12,10 @@ class Config:
 
     # model
     d_model: int = 512
-    n_layers: int = 8
+    n_layers: int = 6
     n_heads: int = 8
     ffn_dim: int = 2048
-    dropout: float = 0.0
+    dropout: float = 0.01
     decoder_layers: int = 6
     # per-token sine-wave channel count: each of the L encoder slots emits
     # d_sine independent (A, f, φ) triples. The decoder consumes the summed
@@ -44,7 +44,7 @@ class Config:
     weight_decay: float = 0.01
     warmup_steps: int = 2000
     max_steps: int = 20000
-    grad_clip: float = 1.0
+    grad_clip: float = 1.5
     log_every: int = 50
     val_every: int = 1000
     val_batches: int = 50
@@ -56,14 +56,14 @@ class Config:
     clip_dataset_config: str = "pair"
     clip_max_len: int = 128  # truncate longer sentences (GPT-2 BPE tokens)
     clip_val_frac: float = 0.05  # last 5% of train held out as validation
-    clip_batch_size: int = 128
+    clip_batch_size: int = 512
     # Gradient accumulation: each optimizer step backpropagates the average over
     # this many mini-batches. Smooths gradient direction estimates without
     # raising peak memory. Note: this does NOT give more in-batch negatives —
     # each mini-batch still computes its loss against its own (B-1) negatives.
     clip_grad_accum_steps: int = 1
     clip_lr: float = 1e-4
-    clip_warmup_steps: int = 3000
+    clip_warmup_steps: int = 2500
     clip_max_steps: int = 100000
     clip_logit_scale_init: float = 2.6593 # ln(1/0.07) — CLIP default
     clip_logit_scale_max: float = 4.6052  # ln(100) — clamp ceiling per CLIP
@@ -71,7 +71,21 @@ class Config:
     clip_val_every: int = 1000
     clip_val_batches: int = 50
     clip_ckpt_every: int = 2000
-    clip_ckpt_dir: str = "all-training/clip_large_model_long_2"
+    clip_ckpt_dir: str = "all-training/clip_large_model_long_3"
+    # Gradient caching (Gao et al. 2021). When set and < clip_batch_size, the
+    # contrastive loss is computed across the full clip_batch_size of negatives
+    # while only chunk_size examples are forwarded with grad at a time. Lets
+    # you raise clip_batch_size (more negatives) without raising peak memory.
+    # None disables (single forward pass, current behavior).
+    clip_cache_chunk_size: int = 128
+    # Multi-source contrastive mix. Each entry is (hf_dataset_name, config_name);
+    # use "" for datasets without a config. When non-empty, this overrides the
+    # legacy single-source clip_dataset_name / clip_dataset_config.
+    clip_dataset_specs: tuple = (
+        ("sentence-transformers/all-nli", "pair"),
+        ("sentence-transformers/quora-duplicates", "pair"),
+        ("sentence-transformers/altlex", ""),
+    )
 
     # runtime
     device: str = "mps"

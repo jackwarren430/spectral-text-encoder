@@ -6,58 +6,95 @@ from torch.utils.data import DataLoader, Dataset
 CACHE_DIR = os.path.join(os.path.dirname(__file__), ".cache")
 
 
-def build_nli_pairs(cfg):
-    """Tokenize anchor/positive sentence pairs from the configured NLI dataset.
+# Columns that indicate (anchor, positive) pairs across the various
+# sentence-transformers datasets. Order = priority.
+_PAIR_COLUMN_CANDIDATES = [
+    ("anchor", "positive"),
+    ("sentence1", "sentence2"),
+    ("question1", "question2"),
+    ("premise", "hypothesis"),
+    ("text", "simplified"),  # sentence-transformers/altlex
+]
 
-    Returns dict with:
-        'a': list[list[int]]  — anchor token ids per example
-        'p': list[list[int]]  — positive token ids per example
-        'pad_id': int          — token id used for padding in the collate fn
-    Both lists are variable-length, capped at cfg.clip_max_len.
-    """
+
+def _detect_pair_columns(cols):
+    for a_col, p_col in _PAIR_COLUMN_CANDIDATES:
+        if a_col in cols and p_col in cols:
+            return a_col, p_col
+    return None, None
+
+
+def _build_one_source(name, dataset_config, tokenizer, tokenizer_name, max_len):
+    """Tokenize a single (anchor, positive) source. Cached per (name, config,
+    tokenizer, max_len). Returns dict with 'a': list[list[int]], 'p': list[list[int]]."""
     os.makedirs(CACHE_DIR, exist_ok=True)
-    safe_name = cfg.clip_dataset_name.replace("/", "_")
+    safe_name = name.replace("/", "_")
+    safe_conf = dataset_config or "default"
     cache_path = os.path.join(
         CACHE_DIR,
-        f"{safe_name}_{cfg.clip_dataset_config}_{cfg.tokenizer_name}_max{cfg.clip_max_len}.pt",
+        f"{safe_name}_{safe_conf}_{tokenizer_name}_max{max_len}.pt",
     )
     if os.path.exists(cache_path):
         return torch.load(cache_path)
 
     from datasets import load_dataset
-    from transformers import AutoTokenizer
 
-    tokenizer = AutoTokenizer.from_pretrained(cfg.tokenizer_name)
-    pad_id = tokenizer.pad_token_id
-    if pad_id is None:
-        # GPT-2 has no pad token; reuse eos. The pad positions will be masked
-        # out by pad_mask so the actual id value never affects the result.
-        pad_id = tokenizer.eos_token_id
-
-    ds = load_dataset(cfg.clip_dataset_name, cfg.clip_dataset_config, split="train")
-    cols = ds.column_names
-    if "anchor" in cols and "positive" in cols:
-        a_col, p_col = "anchor", "positive"
-    elif "sentence1" in cols and "sentence2" in cols:
-        a_col, p_col = "sentence1", "sentence2"
+    if dataset_config:
+        ds = load_dataset(name, dataset_config, split="train")
     else:
-        raise RuntimeError(f"Unexpected NLI dataset columns: {cols}")
+        ds = load_dataset(name, split="train")
+    a_col, p_col = _detect_pair_columns(ds.column_names)
+    if a_col is None:
+        raise RuntimeError(
+            f"Could not find a (anchor, positive) column pair in {name} "
+            f"(config={dataset_config!r}). Columns: {ds.column_names}"
+        )
 
-    a_ids = []
-    p_ids = []
+    a_ids, p_ids = [], []
     for a, p in zip(ds[a_col], ds[p_col]):
         if not a or not p:
             continue
-        ai = tokenizer(a, add_special_tokens=False, truncation=True, max_length=cfg.clip_max_len)["input_ids"]
-        pi = tokenizer(p, add_special_tokens=False, truncation=True, max_length=cfg.clip_max_len)["input_ids"]
+        ai = tokenizer(a, add_special_tokens=False, truncation=True, max_length=max_len)["input_ids"]
+        pi = tokenizer(p, add_special_tokens=False, truncation=True, max_length=max_len)["input_ids"]
         if not ai or not pi:
             continue
         a_ids.append(ai)
         p_ids.append(pi)
 
-    blob = {"a": a_ids, "p": p_ids, "pad_id": int(pad_id)}
+    blob = {"a": a_ids, "p": p_ids}
     torch.save(blob, cache_path)
     return blob
+
+
+def _resolve_specs(cfg):
+    """Pick which (name, config) sources to load. Multi-source if
+    cfg.clip_dataset_specs is non-empty; otherwise fall back to the legacy
+    single-source fields."""
+    specs = list(getattr(cfg, "clip_dataset_specs", None) or ())
+    if specs:
+        # Tolerate JSON-roundtripped specs being lists of lists.
+        return [(s[0], s[1]) for s in specs]
+    return [(cfg.clip_dataset_name, cfg.clip_dataset_config)]
+
+
+def build_pairs(cfg):
+    """Tokenize all configured sources, returning a list of per-source dicts and
+    the shared pad-token id. Each source dict has 'name', 'a', 'p'."""
+    from transformers import AutoTokenizer
+
+    tokenizer = AutoTokenizer.from_pretrained(cfg.tokenizer_name)
+    pad_id = tokenizer.pad_token_id
+    if pad_id is None:
+        # GPT-2 has no pad token; reuse eos. Pad positions are masked out by
+        # pad_mask so the actual id value never affects the result.
+        pad_id = tokenizer.eos_token_id
+
+    sources = []
+    for name, dconf in _resolve_specs(cfg):
+        blob = _build_one_source(name, dconf, tokenizer, cfg.tokenizer_name, cfg.clip_max_len)
+        sources.append({"name": name, "config": dconf, "a": blob["a"], "p": blob["p"]})
+        print(f"[data_clip] {name} ({dconf or 'default'}): {len(blob['a'])} pairs")
+    return sources, int(pad_id)
 
 
 class PairDataset(Dataset):
@@ -102,13 +139,23 @@ class PairCollate:
 
 
 def make_clip_loaders(cfg):
-    blob = build_nli_pairs(cfg)
-    a, p, pad_id = blob["a"], blob["p"], blob["pad_id"]
-    n = len(a)
-    n_val = max(1, int(n * cfg.clip_val_frac))
-    n_train = n - n_val
-    train_ds = PairDataset(a[:n_train], p[:n_train])
-    val_ds = PairDataset(a[n_train:], p[n_train:])
+    sources, pad_id = build_pairs(cfg)
+
+    # Hold out cfg.clip_val_frac from EACH source independently so the val set
+    # stays representative across sources rather than collapsing onto whichever
+    # source ends up at the tail of a concatenated list.
+    train_a, train_p, val_a, val_p = [], [], [], []
+    for src in sources:
+        n = len(src["a"])
+        n_val = max(1, int(n * cfg.clip_val_frac))
+        n_train = n - n_val
+        train_a.extend(src["a"][:n_train])
+        train_p.extend(src["p"][:n_train])
+        val_a.extend(src["a"][n_train:])
+        val_p.extend(src["p"][n_train:])
+
+    train_ds = PairDataset(train_a, train_p)
+    val_ds = PairDataset(val_a, val_p)
 
     collate = PairCollate(pad_id)
     train_loader = DataLoader(

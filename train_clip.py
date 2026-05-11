@@ -10,7 +10,7 @@ from torch.optim import AdamW
 from tqdm import tqdm
 
 from config import Config
-from model import SpectralAE, synthesize
+from model import SpectralAE, freq_separation_loss, synthesize
 from run_utils import (
     MetricsLogger,
     find_latest_ckpt,
@@ -39,12 +39,33 @@ def pick_device(requested: str) -> str:
     return requested
 
 
+def _snapshot_rng(device):
+    state = {"cpu": torch.get_rng_state()}
+    if device == "cuda" and torch.cuda.is_available():
+        state["cuda"] = torch.cuda.get_rng_state()
+    elif device == "mps" and torch.backends.mps.is_available():
+        state["mps"] = torch.mps.get_rng_state()
+    return state
+
+
+def _restore_rng(state, device):
+    torch.set_rng_state(state["cpu"])
+    if device == "cuda" and "cuda" in state:
+        torch.cuda.set_rng_state(state["cuda"])
+    elif device == "mps" and "mps" in state:
+        torch.mps.set_rng_state(state["mps"])
+
+
 def encode_to_embedding(model, tokens, pad_mask, cfg: Config):
-    """encoder → synthesize → flatten → L2-normalize. Returns (B, N*d_sine)."""
+    """encoder → synthesize → flatten → L2-normalize.
+
+    Returns (emb, f) where emb has shape (B, N*d_sine) and f has shape
+    (B, L, d_sine). f is exposed so the caller can apply freq_separation_loss
+    during training; it's safe to ignore at inference."""
     A, f, phi = model.encoder(tokens, pad_mask=pad_mask)
     signal = synthesize(A, f, phi, cfg.n_samples, cfg.duration)
-    emb = signal.flatten(1)
-    return F.normalize(emb, dim=-1)
+    emb = F.normalize(signal.flatten(1), dim=-1)
+    return emb, f
 
 
 def contrastive_loss(emb_a, emb_b, logit_scale):
@@ -65,8 +86,8 @@ def validate(model, loader, logit_scale, device, cfg: Config, max_batches: int):
         if i >= max_batches:
             break
         ta, ma, tp, mp = [x.to(device) for x in batch]
-        ea = encode_to_embedding(model, ta, ma, cfg)
-        eb = encode_to_embedding(model, tp, mp, cfg)
+        ea, _ = encode_to_embedding(model, ta, ma, cfg)
+        eb, _ = encode_to_embedding(model, tp, mp, cfg)
         loss, logits = contrastive_loss(ea, eb, logit_scale)
         targets = torch.arange(ea.size(0), device=device)
         total_loss += loss.item() * ea.size(0)
@@ -74,6 +95,86 @@ def validate(model, loader, logit_scale, device, cfg: Config, max_batches: int):
         total += ea.size(0)
     model.train()
     return total_loss / max(1, total), total_correct / max(1, total)
+
+
+def micro_step_direct(model, batch, logit_scale, cfg, accum, min_sep, device):
+    """Single forward+backward over the full mini-batch. Returns
+    (ce_value, aux_value, n_correct, n_total) or None if loss was non-finite.
+    Backward has already been called when this returns."""
+    ta, ma, tp, mp = [x.to(device) for x in batch]
+    ea, fa = encode_to_embedding(model, ta, ma, cfg)
+    eb, fb = encode_to_embedding(model, tp, mp, cfg)
+    loss_ce, logits = contrastive_loss(ea, eb, logit_scale)
+    aux = 0.5 * (
+        freq_separation_loss(fa.flatten(1, 2), min_sep)
+        + freq_separation_loss(fb.flatten(1, 2), min_sep)
+    )
+    total = loss_ce + cfg.freq_sep_lambda * aux
+    if not torch.isfinite(total):
+        return None
+    (total / accum).backward()
+    targets = torch.arange(ea.size(0), device=device)
+    correct = (logits.argmax(-1) == targets).sum().item()
+    return loss_ce.item(), aux.item(), correct, ea.size(0)
+
+
+def micro_step_grad_cache(model, batch, logit_scale, cfg, accum, min_sep, device, chunk):
+    """GradCache (Gao et al. 2021). Pass 1: forward each chunk under no_grad,
+    collect embeddings. Compute symmetric InfoNCE on the full batch and cache
+    dL/dE_a, dL/dE_b. Pass 2: re-forward each chunk WITH grad and call
+    autograd.backward(emb, grad_tensors=cached_grad) so the model receives the
+    full-batch gradient. Aux is per-chunk; chunk contributions are weighted by
+    chunk_size/B so the average matches what direct mode would compute."""
+    ta, ma, tp, mp = [x.to(device) for x in batch]
+    B = ta.size(0)
+
+    # Pass 1: collect embeddings under no_grad. Snapshot RNG per chunk so pass 2
+    # can reproduce dropout (cfg.dropout=0 today, but keep this correct).
+    rng_states = []
+    embs_a, embs_b = [], []
+    for s in range(0, B, chunk):
+        e = min(B, s + chunk)
+        rng_states.append(_snapshot_rng(device))
+        with torch.no_grad():
+            ea, _ = encode_to_embedding(model, ta[s:e], ma[s:e], cfg)
+            eb, _ = encode_to_embedding(model, tp[s:e], mp[s:e], cfg)
+        embs_a.append(ea)
+        embs_b.append(eb)
+
+    EA = torch.cat(embs_a, dim=0).detach().requires_grad_(True)
+    EB = torch.cat(embs_b, dim=0).detach().requires_grad_(True)
+    loss_ce, logits = contrastive_loss(EA, EB, logit_scale)
+    if not torch.isfinite(loss_ce):
+        return None
+    # This populates EA.grad, EB.grad, and logit_scale.grad with the /accum
+    # factor baked in — matching what direct mode does.
+    (loss_ce / accum).backward()
+    cached_dEA = EA.grad.detach()
+    cached_dEB = EB.grad.detach()
+    targets = torch.arange(B, device=device)
+    correct = (logits.argmax(-1) == targets).sum().item()
+
+    # Pass 2: re-forward each chunk WITH grad, push cached gradient + aux.
+    aux_weighted_sum = 0.0
+    for i, s in enumerate(range(0, B, chunk)):
+        e = min(B, s + chunk)
+        _restore_rng(rng_states[i], device)
+        ea, fa = encode_to_embedding(model, ta[s:e], ma[s:e], cfg)
+        eb, fb = encode_to_embedding(model, tp[s:e], mp[s:e], cfg)
+        aux_chunk = 0.5 * (
+            freq_separation_loss(fa.flatten(1, 2), min_sep)
+            + freq_separation_loss(fb.flatten(1, 2), min_sep)
+        )
+        n_chunk = e - s
+        aux_weighted_sum += aux_chunk.item() * n_chunk
+        # full-batch aux mean = sum_chunks(aux_chunk * n_chunk) / B, so each
+        # chunk contributes lambda * aux_chunk * (n_chunk/B) / accum.
+        aux_term = (cfg.freq_sep_lambda * aux_chunk * n_chunk / B) / accum
+        torch.autograd.backward(
+            tensors=[ea, eb, aux_term],
+            grad_tensors=[cached_dEA[s:e], cached_dEB[s:e], torch.ones_like(aux_term)],
+        )
+    return loss_ce.item(), aux_weighted_sum / B, correct, B
 
 
 def train(cfg: Config, run_dir: str, resume_ckpt: str | None):
@@ -95,10 +196,17 @@ def train(cfg: Config, run_dir: str, resume_ckpt: str | None):
     )
     enc_n = sum(p.numel() for p in encoder_params)
     eff_batch = cfg.clip_batch_size * cfg.clip_grad_accum_steps
+    use_grad_cache = (
+        cfg.clip_cache_chunk_size is not None
+        and cfg.clip_cache_chunk_size < cfg.clip_batch_size
+    )
+    cache_chunk = cfg.clip_cache_chunk_size if use_grad_cache else None
+    mode = f"grad_cache(chunk={cache_chunk})" if use_grad_cache else "direct"
     print(
         f"[train_clip] encoder params={enc_n/1e6:.2f}M  "
         f"logit_scale init={logit_scale.exp().item():.2f}  "
-        f"batch={cfg.clip_batch_size}×{cfg.clip_grad_accum_steps}={eff_batch}"
+        f"batch={cfg.clip_batch_size}×{cfg.clip_grad_accum_steps}={eff_batch}  "
+        f"mode={mode}"
     )
 
     opt = AdamW(
@@ -127,18 +235,21 @@ def train(cfg: Config, run_dir: str, resume_ckpt: str | None):
     metrics = MetricsLogger(run_dir)
     t0 = time.time()
     running_loss = 0.0
+    running_aux = 0.0
     running_correct = 0
     running_total = 0
     running_gnorm = 0.0
     running_gnorm_count = 0
     train_iter = iter(train_loader)
     accum = max(1, cfg.clip_grad_accum_steps)
+    min_sep = cfg.freq_sep_min_bins / cfg.duration
 
     pbar = tqdm(total=cfg.clip_max_steps, initial=step, desc="train_clip", dynamic_ncols=True)
     try:
         while step < cfg.clip_max_steps:
             opt.zero_grad(set_to_none=True)
             accum_loss_sum = 0.0
+            accum_aux_sum = 0.0
             accum_correct = 0
             accum_total = 0
             for _ in range(accum):
@@ -147,18 +258,22 @@ def train(cfg: Config, run_dir: str, resume_ckpt: str | None):
                 except StopIteration:
                     train_iter = iter(train_loader)
                     batch = next(train_iter)
-                ta, ma, tp, mp = [x.to(device) for x in batch]
-                ea = encode_to_embedding(model, ta, ma, cfg)
-                eb = encode_to_embedding(model, tp, mp, cfg)
-                loss, logits = contrastive_loss(ea, eb, logit_scale)
-                if not torch.isfinite(loss):
-                    tqdm.write(f"step {step+1:6d}: non-finite loss ({loss.item()}); skipping mini-batch")
+                if use_grad_cache:
+                    result = micro_step_grad_cache(
+                        model, batch, logit_scale, cfg, accum, min_sep, device, cache_chunk
+                    )
+                else:
+                    result = micro_step_direct(
+                        model, batch, logit_scale, cfg, accum, min_sep, device
+                    )
+                if result is None:
+                    tqdm.write(f"step {step+1:6d}: non-finite loss; skipping mini-batch")
                     continue
-                (loss / accum).backward()
-                targets = torch.arange(ea.size(0), device=device)
-                accum_loss_sum += loss.item() * ea.size(0)
-                accum_correct += (logits.argmax(-1) == targets).sum().item()
-                accum_total += ea.size(0)
+                ce_v, aux_v, correct, total = result
+                accum_loss_sum += ce_v * total
+                accum_aux_sum += aux_v * total
+                accum_correct += correct
+                accum_total += total
 
             if accum_total == 0:
                 step += 1
@@ -172,6 +287,7 @@ def train(cfg: Config, run_dir: str, resume_ckpt: str | None):
                 logit_scale.clamp_(max=cfg.clip_logit_scale_max)
 
             running_loss += accum_loss_sum
+            running_aux += accum_aux_sum
             running_correct += accum_correct
             running_total += accum_total
             running_gnorm += float(gnorm)
@@ -184,6 +300,7 @@ def train(cfg: Config, run_dir: str, resume_ckpt: str | None):
 
             if step % cfg.clip_log_every == 0:
                 avg_loss = running_loss / running_total
+                avg_aux = running_aux / running_total
                 acc = running_correct / running_total
                 dt = time.time() - t0
                 ms = dt / cfg.clip_log_every * 1000
@@ -191,18 +308,20 @@ def train(cfg: Config, run_dir: str, resume_ckpt: str | None):
                 scale = logit_scale.exp().item()
                 avg_gnorm = running_gnorm / max(1, running_gnorm_count)
                 tqdm.write(
-                    f"step {step:6d} | loss {avg_loss:7.4f} | acc {acc*100:5.2f}% | "
-                    f"scale {scale:6.2f} | gnorm {avg_gnorm:6.2f} | lr {lr_now:.2e} | "
-                    f"{ms:.0f}ms/step"
+                    f"step {step:6d} | loss {avg_loss:7.4f} | aux {avg_aux:6.4f} | "
+                    f"acc {acc*100:5.2f}% | scale {scale:6.2f} | gnorm {avg_gnorm:6.2f} | "
+                    f"lr {lr_now:.2e} | {ms:.0f}ms/step"
                 )
                 pbar.set_postfix(loss=f"{avg_loss:.3f}", acc=f"{acc*100:.1f}%", lr=f"{lr_now:.1e}")
                 metrics.log(
                     step=step, event="train",
                     loss=f"{avg_loss:.6f}", acc=f"{acc:.6f}",
                     lr=f"{lr_now:.6e}", gnorm=f"{avg_gnorm:.4f}",
-                    scale=f"{scale:.4f}", ms_per_step=f"{ms:.2f}",
+                    scale=f"{scale:.4f}", aux=f"{avg_aux:.6f}",
+                    ce=f"{avg_loss:.6f}", ms_per_step=f"{ms:.2f}",
                 )
                 running_loss = 0.0
+                running_aux = 0.0
                 running_correct = running_total = 0
                 running_gnorm = 0.0
                 running_gnorm_count = 0

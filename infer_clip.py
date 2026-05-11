@@ -100,8 +100,8 @@ def run(ckpt_path: str, text_a: str, text_b: str, device: str, plot_path: str | 
         A_b, f_b, phi_b = model.encoder(tb, pad_mask=mb)
         sig_b = synthesize(A_b, f_b, phi_b, cfg.n_samples, cfg.duration)
         # Embeddings via the same path training used.
-        emb_a = encode_to_embedding(model, ta, ma, cfg)
-        emb_b = encode_to_embedding(model, tb, mb, cfg)
+        emb_a, _ = encode_to_embedding(model, ta, ma, cfg)
+        emb_b, _ = encode_to_embedding(model, tb, mb, cfg)
 
     cos = (emb_a * emb_b).sum().item()
     norm_a = sig_a.flatten(1).norm().item()
