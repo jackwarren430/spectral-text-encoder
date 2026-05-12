@@ -154,6 +154,18 @@ def make_clip_loaders(cfg):
         val_a.extend(src["a"][n_train:])
         val_p.extend(src["p"][n_train:])
 
+    # Shuffle the val list with a fixed seed so val batches are mixed-source
+    # (matching the cross-source composition of shuffled train batches). Without
+    # this, val batches cluster by source and become artificially harder than
+    # train, inflating the apparent train/val gap. Deterministic across runs.
+    if len(sources) > 1:
+        import random
+        rng = random.Random(1337)
+        idx = list(range(len(val_a)))
+        rng.shuffle(idx)
+        val_a = [val_a[i] for i in idx]
+        val_p = [val_p[i] for i in idx]
+
     train_ds = PairDataset(train_a, train_p)
     val_ds = PairDataset(val_a, val_p)
 

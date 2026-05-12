@@ -36,7 +36,7 @@ class Config:
 
     # frequency-separation auxiliary loss
     freq_sep_min_bins: float = 4.0  # main-lobe width for Hann ≈ 4 bins
-    freq_sep_lambda: float = 0.0
+    freq_sep_lambda: float = 0.05
 
     # training
     batch_size: int = 64
@@ -71,7 +71,7 @@ class Config:
     clip_val_every: int = 1000
     clip_val_batches: int = 50
     clip_ckpt_every: int = 2000
-    clip_ckpt_dir: str = "all-training/a-b_tests/baseline"
+    clip_ckpt_dir: str = "all-training/clip_large_model_long_3"
     # Gradient caching (Gao et al. 2021). When set and < clip_batch_size, the
     # contrastive loss is computed across the full clip_batch_size of negatives
     # while only chunk_size examples are forwarded with grad at a time. Lets
@@ -82,7 +82,11 @@ class Config:
     # use "" for datasets without a config. When non-empty, this overrides the
     # legacy single-source clip_dataset_name / clip_dataset_config. Empty tuple
     # = use the legacy single-source path (clip_dataset_name + clip_dataset_config).
-    clip_dataset_specs: tuple = ()
+    clip_dataset_specs: tuple = (                                                                                                                      
+        ("sentence-transformers/all-nli", "pair"),                                                                                                     
+        ("sentence-transformers/quora-duplicates", "pair"),                                                                                            
+        ("sentence-transformers/altlex", ""),                                                                                                          
+    )
     # Embedding for the contrastive loss. "time": flatten the synthesized
     # waveform directly (current behavior). "spectral": take |rfft(signal)| per
     # channel before flatten + L2-normalize — phase-invariant; dimensionality
