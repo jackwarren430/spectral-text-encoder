@@ -1,0 +1,55 @@
+(dl) root@97f3ebb759bb:~/repos/spectral-text-encoder# python train_clip.py 
+[train_clip] device=cuda  run_dir=all-training/a-b_tests/baseline/2026-05-12_02-21-56
+Warning: You are sending unauthenticated requests to the HF Hub. Please set a HF_TOKEN to enable higher rate limits and faster downloads.
+/root/repos/spectral-text-encoder/data_clip.py:38: FutureWarning: You are using `torch.load` with `weights_only=False` (the current default value), which uses the default pickle module implicitly. It is possible to construct malicious pickle data which will execute arbitrary code during unpickling (See https://github.com/pytorch/pytorch/blob/main/SECURITY.md#untrusted-models for more details). In a future release, the default value for `weights_only` will be flipped to `True`. This limits the functions that could be executed during unpickling. Arbitrary objects will no longer be allowed to be loaded via this mode unless they are explicitly allowlisted by the user via `torch.serialization.add_safe_globals`. We recommend you start setting `weights_only=True` for any use case where you don't have full control of the loaded file. Please open an issue on GitHub for any issues related to this experimental feature.
+  return torch.load(cache_path)
+[data_clip] sentence-transformers/all-nli (pair): 314315 pairs
+[data_clip] sentence-transformers/quora-duplicates (pair): 149263 pairs
+[data_clip] sentence-transformers/altlex (default): 112696 pairs
+[train_clip] train pairs=547462 val pairs=28812
+/usr/local/lib/python3.11/dist-packages/torch/nn/modules/transformer.py:307: UserWarning: enable_nested_tensor is True, but self.use_nested_tensor is False because encoder_layer.norm_first was True
+  warnings.warn(f"enable_nested_tensor is True, but self.use_nested_tensor is False because {why_not_sparsity_fast_path}")
+[train_clip] encoder params=51.49M  logit_scale init=14.29  batch=512×1=512  mode=direct  pc_λ=0.1
+step    100 | loss  6.1464 | aux 2.2743 | pc 6.2738 | acc  4.46% | scale  14.29 | gnorm  16.85 | lr 5.00e-06 | 510ms/step                          
+step    200 | loss  6.1338 | aux 2.2697 | pc 6.2609 | acc  4.54% | scale  14.30 | gnorm  16.57 | lr 1.00e-05 | 497ms/step                          
+step    300 | loss  6.1076 | aux 2.2877 | pc 6.2364 | acc  4.89% | scale  14.33 | gnorm  15.45 | lr 1.50e-05 | 506ms/step                          
+step    400 | loss  6.0742 | aux 2.2516 | pc 6.2176 | acc  5.24% | scale  14.37 | gnorm  13.54 | lr 2.00e-05 | 492ms/step                          
+step    500 | loss  5.9791 | aux 2.2779 | pc 6.1792 | acc  5.30% | scale  14.43 | gnorm  11.04 | lr 2.50e-05 | 499ms/step                          
+step    600 | loss  5.7841 | aux 2.3115 | pc 6.1096 | acc  5.80% | scale  14.51 | gnorm  10.24 | lr 3.00e-05 | 514ms/step                          
+step    700 | loss  5.6247 | aux 2.2694 | pc 6.0643 | acc  5.92% | scale  14.58 | gnorm  10.70 | lr 3.50e-05 | 497ms/step                          
+step    800 | loss  5.4601 | aux 2.2746 | pc 6.0081 | acc  5.98% | scale  14.66 | gnorm  12.42 | lr 4.00e-05 | 498ms/step                          
+step    900 | loss  5.0802 | aux 2.2465 | pc 5.9739 | acc  6.68% | scale  14.71 | gnorm  17.39 | lr 4.50e-05 | 485ms/step                          
+step   1000 | loss  4.8067 | aux 2.2640 | pc 5.9564 | acc  7.64% | scale  14.74 | gnorm  22.93 | lr 5.00e-05 | 493ms/step                          
+           val: loss 4.7530 | aux 2.1219 | pc 5.7948 | acc 9.70%                                                                                   
+step   1100 | loss  4.6493 | aux 2.2436 | pc 5.9247 | acc  8.93% | scale  14.77 | gnorm  24.72 | lr 5.50e-05 | 577ms/step                          
+step   1200 | loss  4.5139 | aux 2.2601 | pc 5.9127 | acc 10.75% | scale  14.79 | gnorm  32.65 | lr 6.00e-05 | 491ms/step                          
+step   1300 | loss  4.3855 | aux 2.2842 | pc 5.9186 | acc 13.03% | scale  14.80 | gnorm  29.69 | lr 6.50e-05 | 502ms/step                          
+step   1400 | loss  4.2544 | aux 2.2754 | pc 5.9357 | acc 15.27% | scale  14.81 | gnorm  26.75 | lr 7.00e-05 | 497ms/step                          
+step   1500 | loss  4.1108 | aux 2.2690 | pc 5.9148 | acc 17.39% | scale  14.81 | gnorm  21.13 | lr 7.50e-05 | 494ms/step                          
+step   1600 | loss  3.9843 | aux 2.3026 | pc 5.8494 | acc 19.33% | scale  14.82 | gnorm  18.72 | lr 8.00e-05 | 504ms/step                          
+step   1700 | loss  3.8434 | aux 2.2680 | pc 5.7682 | acc 21.40% | scale  14.82 | gnorm  15.67 | lr 8.50e-05 | 489ms/step                          
+step   1800 | loss  3.7053 | aux 2.3052 | pc 5.6911 | acc 23.59% | scale  14.83 | gnorm  15.40 | lr 9.00e-05 | 499ms/step                          
+step   1900 | loss  3.6063 | aux 2.3007 | pc 5.6322 | acc 25.45% | scale  14.84 | gnorm  13.74 | lr 9.50e-05 | 498ms/step                          
+step   2000 | loss  3.4703 | aux 2.2982 | pc 5.5481 | acc 27.07% | scale  14.85 | gnorm  14.21 | lr 1.00e-04 | 493ms/step                          
+           val: loss 3.7252 | aux 2.1633 | pc 5.3760 | acc 29.02%                                                                                  
+           saved all-training/a-b_tests/baseline/2026-05-12_02-21-56/step_2000.pt                                                                  
+step   2100 | loss  3.4013 | aux 2.3118 | pc 5.4854 | acc 28.05% | scale  14.87 | gnorm  12.20 | lr 1.05e-04 | 585ms/step                          
+step   2200 | loss  3.3093 | aux 2.3184 | pc 5.4167 | acc 29.67% | scale  14.90 | gnorm  12.10 | lr 1.10e-04 | 506ms/step                          
+step   2300 | loss  3.2510 | aux 2.3197 | pc 5.3604 | acc 30.47% | scale  14.92 | gnorm  10.78 | lr 1.15e-04 | 501ms/step                          
+step   2400 | loss  3.1546 | aux 2.2874 | pc 5.2838 | acc 31.77% | scale  14.94 | gnorm   9.58 | lr 1.20e-04 | 489ms/step                          
+step   2500 | loss  3.0603 | aux 2.2743 | pc 5.1670 | acc 33.44% | scale  14.93 | gnorm   9.33 | lr 1.25e-04 | 491ms/step                          
+step   2600 | loss  3.0466 | aux 2.2845 | pc 5.2292 | acc 33.86% | scale  14.93 | gnorm   9.97 | lr 1.30e-04 | 498ms/step                          
+step   2700 | loss  3.1087 | aux 2.2442 | pc 5.4144 | acc 33.49% | scale  14.89 | gnorm  11.33 | lr 1.35e-04 | 491ms/step                          
+step   2800 | loss  4.6398 | aux 2.1975 | pc 6.0597 | acc 16.77% | scale  14.83 | gnorm  56.34 | lr 1.40e-04 | 498ms/step                          
+step   2900 | loss  4.7798 | aux 2.2056 | pc 6.1963 | acc 14.30% | scale  14.76 | gnorm  59.89 | lr 1.45e-04 | 502ms/step                          
+step   3000 | loss  4.2176 | aux 2.2479 | pc 6.1024 | acc 19.55% | scale  14.71 | gnorm  91.66 | lr 1.50e-04 | 505ms/step                          
+           val: loss 3.6395 | aux 2.1170 | pc 5.3687 | acc 29.69%                                                                                  
+step   3100 | loss  3.1731 | aux 2.2014 | pc 5.5260 | acc 31.32% | scale  14.61 | gnorm   7.36 | lr 1.50e-04 | 567ms/step                          
+step   3200 | loss  2.8631 | aux 2.2199 | pc 5.3706 | acc 36.90% | scale  14.65 | gnorm   6.59 | lr 1.50e-04 | 504ms/step                          
+step   3300 | loss  2.6928 | aux 2.1877 | pc 5.3306 | acc 40.49% | scale  14.81 | gnorm   6.61 | lr 1.50e-04 | 515ms/step                          
+step   3400 | loss  2.6193 | aux 2.1902 | pc 5.3625 | acc 41.65% | scale  14.92 | gnorm   6.63 | lr 1.50e-04 | 514ms/step                          
+step   3500 | loss  2.5101 | aux 2.1577 | pc 5.3342 | acc 43.91% | scale  15.10 | gnorm   5.63 | lr 1.50e-04 | 502ms/step                          
+step   3600 | loss  2.4218 | aux 2.0949 | pc 5.3167 | acc 45.57% | scale  15.31 | gnorm   5.56 | lr 1.50e-04 | 489ms/step                          
+step   3700 | loss  2.3490 | aux 2.0719 | pc 5.3274 | acc 47.59% | scale  15.47 | gnorm   5.98 | lr 1.50e-04 | 490ms/step                          
+step   3800 | loss  2.2928 | aux 2.0459 | pc 5.3159 | acc 48.54% | scale  15.63 | gnorm   6.20 | lr 1.50e-04 | 492ms/step                          
+train_clip:   4%|██                                                    | 3828/100000 [32:11<13:41:31,  1.95it/s, acc=48.5%, loss=2.293, lr=1.5e-04]Connection to 100.65.31.172 closed.

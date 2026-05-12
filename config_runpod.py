@@ -77,7 +77,7 @@ class Config:
     # while only chunk_size examples are forwarded with grad at a time. Lets
     # you raise clip_batch_size (more negatives) without raising peak memory.
     # None disables (single forward pass, current behavior).
-    clip_cache_chunk_size: int = 64
+    clip_cache_chunk_size: int = 512
     # Multi-source contrastive mix. Each entry is (hf_dataset_name, config_name);
     # use "" for datasets without a config. When non-empty, this overrides the
     # legacy single-source clip_dataset_name / clip_dataset_config. Empty tuple
