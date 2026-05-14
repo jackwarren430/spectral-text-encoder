@@ -4,7 +4,7 @@ from dataclasses import dataclass
 @dataclass
 class Config:
     # data
-    seq_len: int = 16
+    seq_len: int = 32
     tokenizer_name: str = "gpt2"
     vocab_size: int = 50257
     dataset_name: str = "wikitext"
@@ -16,7 +16,7 @@ class Config:
     n_heads: int = 8
     ffn_dim: int = 2048
     dropout: float = 0.1
-    decoder_layers: int = 6
+    decoder_layers: int = 8
     # per-token sine-wave channel count: each of the L encoder slots emits
     # d_sine independent (A, f, φ) triples. The decoder consumes the summed
     # multi-channel waveform directly (no FFT round-trip).
@@ -39,21 +39,21 @@ class Config:
     freq_sep_lambda: float = 0.05
 
     # training
-    batch_size: int = 64
-    lr: float = 3e-4
+    batch_size: int = 128
+    lr: float = 2e-4
     weight_decay: float = 0.05
     warmup_steps: int = 2000
-    max_steps: int = 20000
+    max_steps: int = 100000
     grad_clip: float = 1.2
     log_every: int = 50
     val_every: int = 1000
     val_batches: int = 50
-    ckpt_every: int = 2000
-    ckpt_dir: str = "all-training/checkpoints"
+    ckpt_every: int = 1000
+    ckpt_dir: str = "all-training/frozen-encoder/"
     # Freeze the encoder (and its tied token_emb output projection) during AE
     # training. Intended use: load a CLIP-trained checkpoint via --init-from
     # and train only the decoder to reconstruct from the frozen waveforms.
-    freeze_encoder: bool = False
+    freeze_encoder: bool = True
 
     # CLIP-style contrastive training (train_clip.py)
     clip_dataset_name: str = "sentence-transformers/all-nli"
@@ -108,6 +108,6 @@ class Config:
     clip_recon_lambda: float = 0.0
 
     # runtime
-    device: str = "mps"
-    num_workers: int = 2
+    device: str = "cuda"
+    num_workers: int = 16
     seed: int = 0
