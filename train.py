@@ -39,7 +39,7 @@ def pick_device(requested: str) -> str:
 
 
 @torch.no_grad()
-def validate(model, loader, device, max_batches: int):
+def validate(model, loader, device, max_batches: int, freeze_encoder: bool = False):
     model.eval()
     total_loss = 0.0
     total_correct = 0
@@ -54,10 +54,12 @@ def validate(model, loader, device, max_batches: int):
         total_correct += (logits.argmax(-1) == targets).sum().item()
         total_count += targets.numel()
     model.train()
+    if freeze_encoder:
+        model.encoder.eval()
     return total_loss / max(1, total_count), total_correct / max(1, total_count)
 
 
-def train(cfg: Config, run_dir: str, resume_ckpt: str | None):
+def train(cfg: Config, run_dir: str, resume_ckpt: str | None, init_from: str | None = None):
     from data import make_loaders
 
     device = pick_device(cfg.device)
@@ -67,13 +69,31 @@ def train(cfg: Config, run_dir: str, resume_ckpt: str | None):
     print(f"[train] train chunks={len(train_loader.dataset)} val chunks={len(val_loader.dataset)}")
 
     model = SpectralAE(cfg).to(device)
-    n_params = sum(p.numel() for p in model.parameters())
-    print(f"[train] params={n_params/1e6:.2f}M")
-
-    opt = AdamW(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
-    sched = torch.optim.lr_scheduler.LambdaLR(opt, lr_lambda=lambda s: lr_lambda(s, cfg))
 
     step = 0
+    if init_from:
+        # Initialize model weights from another checkpoint (e.g. a CLIP-trained
+        # run) but start a fresh optimizer/scheduler/step counter.
+        if resume_ckpt:
+            raise RuntimeError("--init-from cannot be combined with --resume")
+        blob = torch.load(init_from, map_location=device, weights_only=False)
+        model.load_state_dict(blob["model"])
+        print(f"[train] initialized weights from {init_from} (step {blob.get('step', '?')})")
+
+    if cfg.freeze_encoder:
+        for p in model.encoder.parameters():
+            p.requires_grad = False
+        model.encoder.eval()
+
+    trainable = [p for p in model.parameters() if p.requires_grad]
+    n_total = sum(p.numel() for p in model.parameters())
+    n_train = sum(p.numel() for p in trainable)
+    print(f"[train] params={n_total/1e6:.2f}M  trainable={n_train/1e6:.2f}M"
+          f"{'  (encoder frozen)' if cfg.freeze_encoder else ''}")
+
+    opt = AdamW(trainable, lr=cfg.lr, weight_decay=cfg.weight_decay)
+    sched = torch.optim.lr_scheduler.LambdaLR(opt, lr_lambda=lambda s: lr_lambda(s, cfg))
+
     if resume_ckpt:
         blob = torch.load(resume_ckpt, map_location=device)
         model.load_state_dict(blob["model"])
@@ -113,7 +133,7 @@ def train(cfg: Config, run_dir: str, resume_ckpt: str | None):
                 continue
             opt.zero_grad(set_to_none=True)
             loss.backward()
-            gnorm = torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)
+            gnorm = torch.nn.utils.clip_grad_norm_(trainable, cfg.grad_clip)
             opt.step()
             sched.step()
 
@@ -148,7 +168,7 @@ def train(cfg: Config, run_dir: str, resume_ckpt: str | None):
                 t0 = time.time()
 
             if step % cfg.val_every == 0:
-                vloss, vacc = validate(model, val_loader, device, cfg.val_batches)
+                vloss, vacc = validate(model, val_loader, device, cfg.val_batches, cfg.freeze_encoder)
                 tqdm.write(f"           val loss {vloss:.4f} | val acc {vacc*100:.2f}%")
                 metrics.log(
                     step=step, event="val",
@@ -179,12 +199,22 @@ def train(cfg: Config, run_dir: str, resume_ckpt: str | None):
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--resume", default=None, help="Run folder to resume from (uses its config.json + latest step_*.pt)")
+    p.add_argument("--init-from", default=None,
+                   help="Path to a .pt checkpoint to initialize model weights from "
+                        "(e.g. a CLIP-trained run). Fresh optimizer/scheduler/step. "
+                        "Mutually exclusive with --resume.")
+    p.add_argument("--freeze-encoder", action="store_true",
+                   help="Freeze encoder params (and its tied output projection); "
+                        "train only the decoder.")
     p.add_argument("--device", default=None)
     p.add_argument("--seq-len", type=int, default=None)
     p.add_argument("--n-samples", type=int, default=None)
     p.add_argument("--batch-size", type=int, default=None)
     p.add_argument("--max-steps", type=int, default=None)
     args = p.parse_args()
+
+    if args.resume and args.init_from:
+        raise SystemExit("--resume and --init-from are mutually exclusive")
 
     if args.resume:
         run_dir = args.resume
@@ -210,12 +240,14 @@ def main():
             cfg.batch_size = args.batch_size
         if args.max_steps:
             cfg.max_steps = args.max_steps
+        if args.freeze_encoder:
+            cfg.freeze_encoder = True
         os.makedirs(cfg.ckpt_dir, exist_ok=True)
         run_dir = make_run_dir(cfg.ckpt_dir)
         save_config(cfg, run_dir)
         resume_ckpt = None
 
-    train(cfg, run_dir, resume_ckpt)
+    train(cfg, run_dir, resume_ckpt, init_from=args.init_from)
 
 
 if __name__ == "__main__":

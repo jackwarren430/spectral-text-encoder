@@ -100,6 +100,8 @@ def main():
                    help="Run STS12-16 + STS-B + SICK-R (default: STS-B test only)")
     p.add_argument("--batch-size", type=int, default=64,
                    help="Batch size for sentence encoding (default: 64)")
+    p.add_argument("--embedding-type", choices=["time", "spectral"], default=None,
+                   help="Override cfg.clip_embedding_type for this eval run")
     args = p.parse_args()
 
     from transformers import AutoTokenizer
@@ -108,6 +110,9 @@ def main():
     print(f"[eval] device={device}  ckpt={args.ckpt}")
     blob = torch.load(args.ckpt, map_location=device, weights_only=False)
     cfg = Config(**blob["cfg"])
+    if args.embedding_type is not None:
+        cfg.clip_embedding_type = args.embedding_type
+        print(f"[eval] overriding clip_embedding_type → {cfg.clip_embedding_type}")
     model = SpectralAE(cfg).to(device)
     model.load_state_dict(blob["model"])
     model.eval()

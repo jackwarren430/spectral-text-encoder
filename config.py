@@ -50,6 +50,10 @@ class Config:
     val_batches: int = 50
     ckpt_every: int = 2000
     ckpt_dir: str = "all-training/checkpoints"
+    # Freeze the encoder (and its tied token_emb output projection) during AE
+    # training. Intended use: load a CLIP-trained checkpoint via --init-from
+    # and train only the decoder to reconstruct from the frozen waveforms.
+    freeze_encoder: bool = False
 
     # CLIP-style contrastive training (train_clip.py)
     clip_dataset_name: str = "sentence-transformers/all-nli"
