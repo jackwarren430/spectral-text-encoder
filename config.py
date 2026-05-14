@@ -4,7 +4,7 @@ from dataclasses import dataclass
 @dataclass
 class Config:
     # data
-    seq_len: int = 32
+    seq_len: int = 16
     tokenizer_name: str = "gpt2"
     vocab_size: int = 50257
     dataset_name: str = "wikitext"
