@@ -73,12 +73,21 @@ def train(cfg: Config, run_dir: str, resume_ckpt: str | None, init_from: str | N
     step = 0
     if init_from:
         # Initialize model weights from another checkpoint (e.g. a CLIP-trained
-        # run) but start a fresh optimizer/scheduler/step counter.
+        # run) but start a fresh optimizer/scheduler/step counter. strict=False
+        # so a current config with e.g. a wider decoder can still load the
+        # encoder + whatever decoder layers do match; remaining params stay at
+        # their fresh init. Useful since CLIP runs leave the decoder untrained.
         if resume_ckpt:
             raise RuntimeError("--init-from cannot be combined with --resume")
         blob = torch.load(init_from, map_location=device, weights_only=False)
-        model.load_state_dict(blob["model"])
+        result = model.load_state_dict(blob["model"], strict=False)
         print(f"[train] initialized weights from {init_from} (step {blob.get('step', '?')})")
+        if result.missing_keys:
+            print(f"[train] {len(result.missing_keys)} missing keys (using fresh init), "
+                  f"e.g. {result.missing_keys[:3]}")
+        if result.unexpected_keys:
+            print(f"[train] {len(result.unexpected_keys)} unexpected keys (ignored), "
+                  f"e.g. {result.unexpected_keys[:3]}")
 
     if cfg.freeze_encoder:
         for p in model.encoder.parameters():
