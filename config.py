@@ -11,10 +11,10 @@ class Config:
     dataset_config: str = "wikitext-103-raw-v1"
 
     # model
-    d_model: int = 512
-    n_layers: int = 8
-    n_heads: int = 8
-    ffn_dim: int = 2048
+    d_model: int = 768
+    n_layers: int = 12
+    n_heads: int = 12
+    ffn_dim: int = 3072
     dropout: float = 0.1
     decoder_layers: int = 8
     # per-token sine-wave channel count: each of the L encoder slots emits
@@ -66,7 +66,7 @@ class Config:
     # raising peak memory. Note: this does NOT give more in-batch negatives —
     # each mini-batch still computes its loss against its own (B-1) negatives.
     clip_grad_accum_steps: int = 1
-    clip_lr: float = 1.5e-4
+    clip_lr: float = 3e-4
     clip_warmup_steps: int = 3000
     clip_max_steps: int = 100000
     clip_logit_scale_init: float = 2.6593 # ln(1/0.07) — CLIP default
@@ -75,13 +75,13 @@ class Config:
     clip_val_every: int = 1000
     clip_val_batches: int = 50
     clip_ckpt_every: int = 2000
-    clip_ckpt_dir: str = "all-training/runpod"
+    clip_ckpt_dir: str = "all-training/comparison-test/bert_arch_dsine_6"
     # Gradient caching (Gao et al. 2021). When set and < clip_batch_size, the
     # contrastive loss is computed across the full clip_batch_size of negatives
     # while only chunk_size examples are forwarded with grad at a time. Lets
     # you raise clip_batch_size (more negatives) without raising peak memory.
     # None disables (single forward pass, current behavior).
-    clip_cache_chunk_size: int = 64
+    clip_cache_chunk_size: int = 32
     # Multi-source contrastive mix. Each entry is (hf_dataset_name, config_name);
     # use "" for datasets without a config. When non-empty, this overrides the
     # legacy single-source clip_dataset_name / clip_dataset_config. Empty tuple
@@ -108,6 +108,6 @@ class Config:
     clip_recon_lambda: float = 0.0
 
     # runtime
-    device: str = "cuda"
-    num_workers: int = 16
+    device: str = "mps"
+    num_workers: int = 2
     seed: int = 0
