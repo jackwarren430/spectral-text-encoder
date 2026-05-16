@@ -91,10 +91,18 @@ class Config:
         ("sentence-transformers/quora-duplicates", "pair"),                                                                                            
         ("sentence-transformers/altlex", ""),                                                                                                          
     )
-    # Embedding for the contrastive loss. "time": flatten the synthesized
-    # waveform directly (current behavior). "spectral": take |rfft(signal)| per
-    # channel before flatten + L2-normalize — phase-invariant; dimensionality
-    # drops to (N//2+1) * d_sine.
+    # Sentence-representation method. "spectral" is the project's spectral
+    # autoencoder path: encoder → (A, f, φ) → synthesize → flatten/rfft. The
+    # baselines pool the encoder's post-LN hidden states directly and skip
+    # synthesis entirely; the sine-parameter head and waveform decoder are not
+    # allocated in those modes. clip_per_channel_lambda / clip_recon_lambda /
+    # freq_sep_lambda MUST be 0 when this is not "spectral".
+    #   "spectral", "mean_pool", "cls", "max_pool"
+    clip_encoder_mode: str = "spectral"
+    # Embedding for the contrastive loss in spectral mode. "time": flatten the
+    # synthesized waveform directly (default). "spectral": take |rfft(signal)|
+    # per channel before flatten + L2-normalize — phase-invariant; dimensionality
+    # drops to (N//2+1) * d_sine. Ignored when clip_encoder_mode != "spectral".
     clip_embedding_type: str = "time"
     # Per-channel InfoNCE auxiliary loss. For each of d_sine channels, compute
     # a contrastive loss using just that channel's slice of the signal and
@@ -111,3 +119,10 @@ class Config:
     device: str = "mps"
     num_workers: int = 2
     seed: int = 0
+
+    def __post_init__(self):
+        valid_modes = {"spectral", "mean_pool", "cls", "max_pool"}
+        if self.clip_encoder_mode not in valid_modes:
+            raise ValueError(
+                f"clip_encoder_mode={self.clip_encoder_mode!r} not in {sorted(valid_modes)}"
+            )

@@ -93,29 +93,36 @@ def run(ckpt_path: str, text_a: str, text_b: str, device: str, plot_path: str | 
     tb, mb = tokenize_one(tokenizer, text_b, cfg.clip_max_len, device)
     print(f"[infer_clip] L_a={ta.size(1)}  L_b={tb.size(1)}  (cap={cfg.clip_max_len})")
 
+    spectral_mode = cfg.clip_encoder_mode == "spectral"
     with torch.no_grad():
-        # Raw waveforms for plotting + magnitude inspection.
-        A_a, f_a, phi_a = model.encoder(ta, pad_mask=ma)
-        sig_a = synthesize(A_a, f_a, phi_a, cfg.n_samples, cfg.duration)
-        A_b, f_b, phi_b = model.encoder(tb, pad_mask=mb)
-        sig_b = synthesize(A_b, f_b, phi_b, cfg.n_samples, cfg.duration)
-        # Embeddings via the same path training used.
+        if spectral_mode:
+            # Raw waveforms for plotting + magnitude inspection.
+            A_a, f_a, phi_a = model.encoder(ta, pad_mask=ma)
+            sig_a = synthesize(A_a, f_a, phi_a, cfg.n_samples, cfg.duration)
+            A_b, f_b, phi_b = model.encoder(tb, pad_mask=mb)
+            sig_b = synthesize(A_b, f_b, phi_b, cfg.n_samples, cfg.duration)
+        else:
+            sig_a = sig_b = None
         emb_a, _ = encode_to_embedding(model, ta, ma, cfg)
         emb_b, _ = encode_to_embedding(model, tb, mb, cfg)
 
     cos = (emb_a * emb_b).sum().item()
-    norm_a = sig_a.flatten(1).norm().item()
-    norm_b = sig_b.flatten(1).norm().item()
     print()
     print(f"  cosine(a, b)        = {cos:+.4f}   (range [-1, 1]; >0 means similar)")
     if logit_scale is not None:
         print(f"  scaled logit        = {cos * logit_scale.exp().item():+.4f}   (what the loss saw)")
-    print(f"  ||signal_a||_2      = {norm_a:.3f}")
-    print(f"  ||signal_b||_2      = {norm_b:.3f}")
+    if spectral_mode:
+        norm_a = sig_a.flatten(1).norm().item()
+        norm_b = sig_b.flatten(1).norm().item()
+        print(f"  ||signal_a||_2      = {norm_a:.3f}")
+        print(f"  ||signal_b||_2      = {norm_b:.3f}")
     print()
     print(f"  text A: {text_a!r}")
     print(f"  text B: {text_b!r}")
 
+    if not spectral_mode:
+        print(f"\n[infer_clip] encoder mode={cfg.clip_encoder_mode} — no waveform to plot")
+        return
     if plot_path is None:
         base, _ = os.path.splitext(ckpt_path)
         plot_path = f"{base}_pair_waveform.png"

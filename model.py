@@ -48,6 +48,7 @@ class SpectralEncoder(nn.Module):
     def __init__(self, cfg):
         super().__init__()
         self.cfg = cfg
+        self.mode = getattr(cfg, "clip_encoder_mode", "spectral")
         self.token_emb = nn.Embedding(cfg.vocab_size, cfg.d_model)
         layer = nn.TransformerEncoderLayer(
             d_model=cfg.d_model,
@@ -59,28 +60,61 @@ class SpectralEncoder(nn.Module):
             norm_first=True,
         )
         self.encoder = nn.TransformerEncoder(layer, num_layers=cfg.n_layers)
-        # head emits 3·d_sine scalars per token: d_sine independent (A, f, φ)
-        # triples that will sum into a d_sine-channel waveform.
-        self.head = nn.Sequential(
-            nn.LayerNorm(cfg.d_model),
-            nn.Linear(cfg.d_model, cfg.d_model),
-            nn.GELU(),
-            nn.Linear(cfg.d_model, cfg.d_model),
-            nn.GELU(),
-            nn.Linear(cfg.d_model, 3 * cfg.d_sine),
-        )
+        if self.mode == "spectral":
+            # head emits 3·d_sine scalars per token: d_sine independent (A, f, φ)
+            # triples that will sum into a d_sine-channel waveform.
+            self.head = nn.Sequential(
+                nn.LayerNorm(cfg.d_model),
+                nn.Linear(cfg.d_model, cfg.d_model),
+                nn.GELU(),
+                nn.Linear(cfg.d_model, cfg.d_model),
+                nn.GELU(),
+                nn.Linear(cfg.d_model, 3 * cfg.d_sine),
+            )
+        else:
+            self.head = None
+        if self.mode == "cls":
+            self.cls_token = nn.Parameter(torch.zeros(cfg.d_model))
+            nn.init.normal_(self.cls_token, std=0.02)
+        else:
+            self.cls_token = None
+
+    def _encode_hidden(self, tokens, pad_mask=None):
+        # Returns (h, eff_mask) where h is (B, L_eff, d_model) post-trunk
+        # hidden states and eff_mask is the matching pad mask (extended with a
+        # False at position 0 in "cls" mode).
+        cfg = self.cfg
+        B, L = tokens.shape
+        emb = self.token_emb(tokens)
+        if self.mode == "cls":
+            cls = self.cls_token.view(1, 1, -1).expand(B, -1, -1).to(emb.dtype)
+            emb = torch.cat([cls, emb], dim=1)
+            if pad_mask is not None:
+                cls_mask = torch.zeros(B, 1, dtype=torch.bool, device=pad_mask.device)
+                pad_mask = torch.cat([cls_mask, pad_mask], dim=1)
+            L = L + 1
+        pe = sinusoidal_pe(L, cfg.d_model, tokens.device, emb.dtype)
+        x = emb + pe
+        h = self.encoder(x, src_key_padding_mask=pad_mask)
+        return h, pad_mask
+
+    def hidden_states(self, tokens, pad_mask=None):
+        """Public access to post-trunk hidden states for baseline pooling."""
+        return self._encode_hidden(tokens, pad_mask)
 
     def forward(self, tokens, pad_mask=None):
         # tokens: (B, L) — L can be anything
         # pad_mask: (B, L) bool with True at PADDING positions (PyTorch convention).
         #   Threaded into the transformer as src_key_padding_mask AND used to
         #   zero A at padded slots so they contribute 0 to the synthesis sum.
+        if self.head is None:
+            raise RuntimeError(
+                f"SpectralEncoder.forward called in mode={self.mode!r}; "
+                f"use hidden_states(...) for baseline pooling."
+            )
         cfg = self.cfg
         B, L = tokens.shape
-        emb = self.token_emb(tokens)
-        pe = sinusoidal_pe(L, cfg.d_model, tokens.device, emb.dtype)
-        x = emb + pe
-        h = self.encoder(x, src_key_padding_mask=pad_mask)
+        h, _ = self._encode_hidden(tokens, pad_mask)
         raw = self.head(h).view(B, L, 3, cfg.d_sine)
         raw_A, raw_f, raw_phi = raw.unbind(-2)  # each (B, L, d_sine)
         real_lengths = (~pad_mask).sum(dim=-1) if pad_mask is not None else None
@@ -166,7 +200,12 @@ class SpectralAE(nn.Module):
         super().__init__()
         self.cfg = cfg
         self.encoder = SpectralEncoder(cfg)
-        self.decoder = WaveformDecoder(cfg)
+        # Waveform decoder is only meaningful in spectral mode (it cross-attends
+        # over the synthesized waveform). Baseline modes skip it entirely.
+        if getattr(cfg, "clip_encoder_mode", "spectral") == "spectral":
+            self.decoder = WaveformDecoder(cfg)
+        else:
+            self.decoder = None
 
     def forward(self, tokens):
         cfg = self.cfg

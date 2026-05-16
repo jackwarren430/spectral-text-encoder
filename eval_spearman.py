@@ -118,8 +118,8 @@ def main():
     model.eval()
     tokenizer = AutoTokenizer.from_pretrained(cfg.tokenizer_name)
     step = blob.get("step", -1)
-    print(f"[eval] step={step}  d_sine={cfg.d_sine}  n_samples={cfg.n_samples}  "
-          f"clip_max_len={cfg.clip_max_len}")
+    print(f"[eval] step={step}  enc={cfg.clip_encoder_mode}  d_sine={cfg.d_sine}  "
+          f"n_samples={cfg.n_samples}  clip_max_len={cfg.clip_max_len}")
 
     datasets = ALL_DATASETS if args.all else DEFAULT_DATASETS
     print()

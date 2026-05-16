@@ -87,12 +87,49 @@ def signal_to_embedding(signal, cfg: Config, channel: int | None = None):
     raise ValueError(f"Unknown clip_embedding_type: {etype!r}")
 
 
+def pool_hidden(h, pad_mask, mode: str):
+    """Pool a (B, L_eff, d_model) hidden-state tensor into (B, d_model).
+
+    pad_mask: (B, L_eff) bool with True at padding. None means all-valid.
+    """
+    if mode == "cls":
+        return h[:, 0]
+    if pad_mask is None:
+        if mode == "mean_pool":
+            return h.mean(dim=1)
+        if mode == "max_pool":
+            return h.max(dim=1).values
+        raise ValueError(f"Unknown pooling mode: {mode!r}")
+    keep = (~pad_mask).to(h.dtype).unsqueeze(-1)  # (B, L_eff, 1)
+    if mode == "mean_pool":
+        return (h * keep).sum(dim=1) / keep.sum(dim=1).clamp(min=1.0)
+    if mode == "max_pool":
+        # Push pads to -inf so they're never the argmax. Use the dtype's min
+        # to stay finite across float16/bfloat16/float32.
+        neg_inf = torch.finfo(h.dtype).min
+        masked = h.masked_fill(pad_mask.unsqueeze(-1), neg_inf)
+        return masked.max(dim=1).values
+    raise ValueError(f"Unknown pooling mode: {mode!r}")
+
+
+def encode_to_pooled_embedding(model, tokens, pad_mask, cfg: Config):
+    """Baseline path: encoder trunk → pool → L2-normalize. Returns (B, d_model)
+    L2-normalized embedding. Used in mean_pool / cls / max_pool modes."""
+    h, eff_mask = model.encoder.hidden_states(tokens, pad_mask)
+    vec = pool_hidden(h, eff_mask, cfg.clip_encoder_mode)
+    return F.normalize(vec, dim=-1)
+
+
 def encode_to_embedding(model, tokens, pad_mask, cfg: Config):
-    """Convenience wrapper: encoder → synthesize → embedding. Used by validate,
-    infer_clip, eval_spearman. Returns (emb, f)."""
-    signal, f = encode_to_signal(model, tokens, pad_mask, cfg)
-    emb = signal_to_embedding(signal, cfg)
-    return emb, f
+    """Convenience wrapper. Dispatches on cfg.clip_encoder_mode. Used by
+    validate, infer_clip, eval_spearman. Returns (emb, f) where f is the
+    encoder's frequency tensor in spectral mode and None otherwise."""
+    if cfg.clip_encoder_mode == "spectral":
+        signal, f = encode_to_signal(model, tokens, pad_mask, cfg)
+        emb = signal_to_embedding(signal, cfg)
+        return emb, f
+    emb = encode_to_pooled_embedding(model, tokens, pad_mask, cfg)
+    return emb, None
 
 
 def reconstruction_ce_sum(model, signal, tokens, pad_mask):
@@ -135,6 +172,37 @@ def contrastive_loss(emb_a, emb_b, logit_scale):
     targets = torch.arange(emb_a.size(0), device=emb_a.device)
     loss = 0.5 * (F.cross_entropy(logits, targets) + F.cross_entropy(logits.T, targets))
     return loss, logits
+
+
+@torch.no_grad()
+def validate_pooled(model, loader, logit_scale, device, cfg: Config, max_batches: int):
+    """Baseline-mode validation: contrastive loss + accuracy only (no aux / pc /
+    recon)."""
+    model.eval()
+    total_ce = 0.0
+    total_correct = 0
+    total = 0
+    for i, batch in enumerate(loader):
+        if i >= max_batches:
+            break
+        ta, ma, tp, mp = [x.to(device) for x in batch]
+        emb_a = encode_to_pooled_embedding(model, ta, ma, cfg)
+        emb_b = encode_to_pooled_embedding(model, tp, mp, cfg)
+        loss_ce, logits = contrastive_loss(emb_a, emb_b, logit_scale)
+        bs = emb_a.size(0)
+        total_ce += loss_ce.item() * bs
+        targets = torch.arange(bs, device=device)
+        total_correct += (logits.argmax(-1) == targets).sum().item()
+        total += bs
+    model.train()
+    n = max(1, total)
+    return {
+        "ce": total_ce / n,
+        "aux": 0.0,
+        "pc": 0.0,
+        "recon": 0.0,
+        "acc": total_correct / n,
+    }
 
 
 @torch.no_grad()
@@ -320,6 +388,64 @@ def micro_step_grad_cache(model, batch, logit_scale, cfg, accum, min_sep, device
             recon_total, correct, B)
 
 
+def micro_step_direct_pooled(model, batch, logit_scale, cfg, accum, device):
+    """Baseline-mode direct step: forward → pool → L2-normalize → contrastive
+    loss → backward. No aux / pc / recon."""
+    ta, ma, tp, mp = [x.to(device) for x in batch]
+    emb_a = encode_to_pooled_embedding(model, ta, ma, cfg)
+    emb_b = encode_to_pooled_embedding(model, tp, mp, cfg)
+    loss_ce, logits = contrastive_loss(emb_a, emb_b, logit_scale)
+    if not torch.isfinite(loss_ce):
+        return None
+    (loss_ce / accum).backward()
+    targets = torch.arange(emb_a.size(0), device=device)
+    correct = (logits.argmax(-1) == targets).sum().item()
+    return loss_ce.item(), 0.0, 0.0, 0.0, correct, emb_a.size(0)
+
+
+def micro_step_grad_cache_pooled(model, batch, logit_scale, cfg, accum, device, chunk):
+    """Baseline-mode GradCache. Cache the L2-normalized pooled embedding rather
+    than the synthesized signal — same recipe as spectral mode but the cached
+    tensor is (B, d_model) instead of (B, n_samples, d_sine), and there are no
+    chunk-local aux / recon terms to recombine in pass 2."""
+    ta, ma, tp, mp = [x.to(device) for x in batch]
+    B = ta.size(0)
+
+    rng_states = []
+    embs_a, embs_b = [], []
+    for s in range(0, B, chunk):
+        e = min(B, s + chunk)
+        rng_states.append(_snapshot_rng(device))
+        with torch.no_grad():
+            ea = encode_to_pooled_embedding(model, ta[s:e], ma[s:e], cfg)
+            eb = encode_to_pooled_embedding(model, tp[s:e], mp[s:e], cfg)
+        embs_a.append(ea)
+        embs_b.append(eb)
+
+    EMB_A = torch.cat(embs_a, dim=0).detach().requires_grad_(True)
+    EMB_B = torch.cat(embs_b, dim=0).detach().requires_grad_(True)
+
+    loss_ce, logits = contrastive_loss(EMB_A, EMB_B, logit_scale)
+    if not torch.isfinite(loss_ce):
+        return None
+    (loss_ce / accum).backward()
+    cached_dEMB_A = EMB_A.grad.detach()
+    cached_dEMB_B = EMB_B.grad.detach()
+    targets = torch.arange(B, device=device)
+    correct = (logits.argmax(-1) == targets).sum().item()
+
+    for i, s in enumerate(range(0, B, chunk)):
+        e = min(B, s + chunk)
+        _restore_rng(rng_states[i], device)
+        ea = encode_to_pooled_embedding(model, ta[s:e], ma[s:e], cfg)
+        eb = encode_to_pooled_embedding(model, tp[s:e], mp[s:e], cfg)
+        torch.autograd.backward(
+            tensors=[ea, eb],
+            grad_tensors=[cached_dEMB_A[s:e], cached_dEMB_B[s:e]],
+        )
+    return loss_ce.item(), 0.0, 0.0, 0.0, correct, B
+
+
 def train(cfg: Config, run_dir: str, resume_ckpt: str | None):
     from data_clip import make_clip_loaders
 
@@ -332,10 +458,29 @@ def train(cfg: Config, run_dir: str, resume_ckpt: str | None):
         f"val pairs={len(val_loader.dataset)}"
     )
 
+    spectral_mode = cfg.clip_encoder_mode == "spectral"
+    if not spectral_mode:
+        # Baseline modes can't compute these losses (no signal, no channels).
+        # Catch this at startup so a typo in a long-running config doesn't
+        # silently fail later under chunked GradCache.
+        bad = []
+        if cfg.clip_per_channel_lambda != 0:
+            bad.append(f"clip_per_channel_lambda={cfg.clip_per_channel_lambda}")
+        if cfg.clip_recon_lambda != 0:
+            bad.append(f"clip_recon_lambda={cfg.clip_recon_lambda}")
+        if cfg.freq_sep_lambda != 0:
+            bad.append(f"freq_sep_lambda={cfg.freq_sep_lambda}")
+        if bad:
+            raise ValueError(
+                f"clip_encoder_mode={cfg.clip_encoder_mode!r} requires "
+                f"per-channel/recon/freq-sep lambdas to be 0; got {', '.join(bad)}"
+            )
+
     model = SpectralAE(cfg).to(device)
     encoder_params = list(model.encoder.parameters())
-    # Decoder participates only when reconstruction aux is enabled.
-    use_recon = cfg.clip_recon_lambda > 0
+    # Decoder participates only when reconstruction aux is enabled (and only
+    # exists at all in spectral mode).
+    use_recon = spectral_mode and cfg.clip_recon_lambda > 0
     decoder_params = list(model.decoder.parameters()) if use_recon else []
     logit_scale = nn.Parameter(
         torch.tensor(cfg.clip_logit_scale_init, device=device, dtype=torch.float32)
@@ -349,8 +494,8 @@ def train(cfg: Config, run_dir: str, resume_ckpt: str | None):
     )
     cache_chunk = cfg.clip_cache_chunk_size if use_grad_cache else None
     mode = f"grad_cache(chunk={cache_chunk})" if use_grad_cache else "direct"
-    extras = []
-    if cfg.clip_embedding_type != "time":
+    extras = [f"enc={cfg.clip_encoder_mode}"]
+    if spectral_mode and cfg.clip_embedding_type != "time":
         extras.append(f"emb={cfg.clip_embedding_type}")
     if cfg.clip_per_channel_lambda > 0:
         extras.append(f"pc_λ={cfg.clip_per_channel_lambda}")
@@ -417,14 +562,24 @@ def train(cfg: Config, run_dir: str, resume_ckpt: str | None):
                 except StopIteration:
                     train_iter = iter(train_loader)
                     batch = next(train_iter)
-                if use_grad_cache:
-                    result = micro_step_grad_cache(
-                        model, batch, logit_scale, cfg, accum, min_sep, device, cache_chunk
-                    )
+                if spectral_mode:
+                    if use_grad_cache:
+                        result = micro_step_grad_cache(
+                            model, batch, logit_scale, cfg, accum, min_sep, device, cache_chunk
+                        )
+                    else:
+                        result = micro_step_direct(
+                            model, batch, logit_scale, cfg, accum, min_sep, device
+                        )
                 else:
-                    result = micro_step_direct(
-                        model, batch, logit_scale, cfg, accum, min_sep, device
-                    )
+                    if use_grad_cache:
+                        result = micro_step_grad_cache_pooled(
+                            model, batch, logit_scale, cfg, accum, device, cache_chunk
+                        )
+                    else:
+                        result = micro_step_direct_pooled(
+                            model, batch, logit_scale, cfg, accum, device
+                        )
                 if result is None:
                     tqdm.write(f"step {step+1:6d}: non-finite loss; skipping mini-batch")
                     continue
@@ -473,12 +628,14 @@ def train(cfg: Config, run_dir: str, resume_ckpt: str | None):
                 scale = logit_scale.exp().item()
                 avg_gnorm = running_gnorm / max(1, running_gnorm_count)
                 extras_line = ""
+                if spectral_mode:
+                    extras_line += f" | aux {avg_aux:6.4f}"
                 if cfg.clip_per_channel_lambda > 0:
                     extras_line += f" | pc {avg_pc:6.4f}"
                 if cfg.clip_recon_lambda > 0:
                     extras_line += f" | recon {avg_recon:6.4f}"
                 tqdm.write(
-                    f"step {step:6d} | loss {avg_loss:7.4f} | aux {avg_aux:6.4f}"
+                    f"step {step:6d} | loss {avg_loss:7.4f}"
                     f"{extras_line} | acc {acc*100:5.2f}% | scale {scale:6.2f} | "
                     f"gnorm {avg_gnorm:6.2f} | lr {lr_now:.2e} | {ms:.0f}ms/step"
                 )
@@ -501,14 +658,21 @@ def train(cfg: Config, run_dir: str, resume_ckpt: str | None):
                 t0 = time.time()
 
             if step % cfg.clip_val_every == 0:
-                v = validate(model, val_loader, logit_scale, device, cfg, cfg.clip_val_batches, min_sep)
+                if spectral_mode:
+                    v = validate(model, val_loader, logit_scale, device, cfg,
+                                 cfg.clip_val_batches, min_sep)
+                else:
+                    v = validate_pooled(model, val_loader, logit_scale, device, cfg,
+                                        cfg.clip_val_batches)
                 vextras = ""
+                if spectral_mode:
+                    vextras += f" | aux {v['aux']:.4f}"
                 if cfg.clip_per_channel_lambda > 0:
                     vextras += f" | pc {v['pc']:.4f}"
                 if cfg.clip_recon_lambda > 0:
                     vextras += f" | recon {v['recon']:.4f}"
                 tqdm.write(
-                    f"           val: loss {v['ce']:.4f} | aux {v['aux']:.4f}"
+                    f"           val: loss {v['ce']:.4f}"
                     f"{vextras} | acc {v['acc']*100:.2f}%"
                 )
                 metrics.log(
