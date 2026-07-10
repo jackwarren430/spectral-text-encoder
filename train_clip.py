@@ -10,7 +10,7 @@ from torch.optim import AdamW
 from tqdm import tqdm
 
 from config import Config
-from model import SpectralAE, freq_separation_loss, synthesize
+from model import SpectralAE, freq_separation_loss, freqs_for_separation, synthesize
 from run_utils import (
     MetricsLogger,
     find_latest_ckpt,
@@ -227,8 +227,8 @@ def validate(model, loader, logit_scale, device, cfg: Config, max_batches: int, 
         emb_b = signal_to_embedding(sig_b, cfg)
         loss_ce, logits = contrastive_loss(emb_a, emb_b, logit_scale)
         aux = 0.5 * (
-            freq_separation_loss(fa.flatten(1, 2), min_sep)
-            + freq_separation_loss(fb.flatten(1, 2), min_sep)
+            freq_separation_loss(freqs_for_separation(fa, cfg), min_sep)
+            + freq_separation_loss(freqs_for_separation(fb, cfg), min_sep)
         )
         bs = emb_a.size(0)
         total_ce += loss_ce.item() * bs
@@ -269,8 +269,8 @@ def micro_step_direct(model, batch, logit_scale, cfg, accum, min_sep, device):
     loss_ce, logits = contrastive_loss(emb_a, emb_b, logit_scale)
 
     aux = 0.5 * (
-        freq_separation_loss(fa.flatten(1, 2), min_sep)
-        + freq_separation_loss(fb.flatten(1, 2), min_sep)
+        freq_separation_loss(freqs_for_separation(fa, cfg), min_sep)
+        + freq_separation_loss(freqs_for_separation(fb, cfg), min_sep)
     )
     pc = sig_a.new_zeros(())
     if cfg.clip_per_channel_lambda > 0:
@@ -360,8 +360,8 @@ def micro_step_grad_cache(model, batch, logit_scale, cfg, accum, min_sep, device
         sig_a, fa = encode_to_signal(model, ta[s:e], ma[s:e], cfg)
         sig_b, fb = encode_to_signal(model, tp[s:e], mp[s:e], cfg)
         aux_chunk = 0.5 * (
-            freq_separation_loss(fa.flatten(1, 2), min_sep)
-            + freq_separation_loss(fb.flatten(1, 2), min_sep)
+            freq_separation_loss(freqs_for_separation(fa, cfg), min_sep)
+            + freq_separation_loss(freqs_for_separation(fb, cfg), min_sep)
         )
         n_chunk = e - s
         aux_weighted_sum += aux_chunk.item() * n_chunk

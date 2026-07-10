@@ -11,19 +11,29 @@ class Config:
     dataset_config: str = "wikitext-103-raw-v1"
 
     # model
-    d_model: int = 768
-    n_layers: int = 12
-    n_heads: int = 12
-    ffn_dim: int = 3072
+    d_model: int = 512
+    n_layers: int = 8
+    n_heads: int = 8
+    ffn_dim: int = 2048
     dropout: float = 0.1
     decoder_layers: int = 8
     # per-token sine-wave channel count: each of the L encoder slots emits
     # d_sine independent (A, f, φ) triples. The decoder consumes the summed
     # multi-channel waveform directly (no FFT round-trip).
-    d_sine: int = 6
+    d_sine: int = 512
+    # Sine parameterization per token slot:
+    #   "independent" (default): each slot emits d_sine independent (A, f, φ)
+    #     triples — d_sine separate single-channel waves.
+    #   "shared": each slot emits a d_sine-dim amplitude vector but a SINGLE
+    #     frequency ω and phase φ shared across all channels — a true
+    #     multi-dimensional sine f(t) = A·sin(ωt + φ), A ∈ R^d_sine. The head
+    #     emits d_sine + 2 scalars per slot instead of 3·d_sine. Everything
+    #     downstream (synthesize, decoder, embeddings) is unchanged because f
+    #     and φ are broadcast to (B, L, d_sine) before synthesis.
+    sine_param_mode: str = "shared"
 
     # signal / FFT
-    n_samples: int = 2048
+    n_samples: int = 512
     duration: float = 1.0
     f_min: float = 1.0
     f_max: float = 960.0  # Nyquist = n_samples / (2*duration) = 1024; leave margin
@@ -43,7 +53,7 @@ class Config:
     lr: float = 2e-4
     weight_decay: float = 0.05
     warmup_steps: int = 2000
-    max_steps: int = 100000
+    max_steps: int = 50000
     grad_clip: float = 1.2
     log_every: int = 50
     val_every: int = 1000
@@ -66,7 +76,7 @@ class Config:
     # raising peak memory. Note: this does NOT give more in-batch negatives —
     # each mini-batch still computes its loss against its own (B-1) negatives.
     clip_grad_accum_steps: int = 1
-    clip_lr: float = 3e-4
+    clip_lr: float = 3e-4 
     clip_warmup_steps: int = 3000
     clip_max_steps: int = 100000
     clip_logit_scale_init: float = 2.6593 # ln(1/0.07) — CLIP default
@@ -75,7 +85,7 @@ class Config:
     clip_val_every: int = 1000
     clip_val_batches: int = 50
     clip_ckpt_every: int = 2000
-    clip_ckpt_dir: str = "all-training/comparison-test/bert_arch_dsine_6"
+    clip_ckpt_dir: str = "all-training/shared/test-1/"
     # Gradient caching (Gao et al. 2021). When set and < clip_batch_size, the
     # contrastive loss is computed across the full clip_batch_size of negatives
     # while only chunk_size examples are forwarded with grad at a time. Lets
@@ -108,7 +118,7 @@ class Config:
     # a contrastive loss using just that channel's slice of the signal and
     # average across channels. Pushes the encoder to keep channels distinct,
     # directly attacking the d_sine-collapse failure mode. 0 disables.
-    clip_per_channel_lambda: float = 0.1
+    clip_per_channel_lambda: float = 0.0
     # Reconstruction auxiliary loss. Runs the decoder on the synthesized
     # waveform and computes CE against the input tokens (AE-mode objective) on
     # both anchor and positive sides. Decoder params join the optimizer when
@@ -125,4 +135,9 @@ class Config:
         if self.clip_encoder_mode not in valid_modes:
             raise ValueError(
                 f"clip_encoder_mode={self.clip_encoder_mode!r} not in {sorted(valid_modes)}"
+            )
+        valid_sine_modes = {"independent", "shared"}
+        if self.sine_param_mode not in valid_sine_modes:
+            raise ValueError(
+                f"sine_param_mode={self.sine_param_mode!r} not in {sorted(valid_sine_modes)}"
             )

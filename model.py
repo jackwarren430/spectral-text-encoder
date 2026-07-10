@@ -61,15 +61,20 @@ class SpectralEncoder(nn.Module):
         )
         self.encoder = nn.TransformerEncoder(layer, num_layers=cfg.n_layers)
         if self.mode == "spectral":
-            # head emits 3·d_sine scalars per token: d_sine independent (A, f, φ)
-            # triples that will sum into a d_sine-channel waveform.
+            # "independent": head emits 3·d_sine scalars per token — d_sine
+            #   independent (A, f, φ) triples summed into a d_sine-channel wave.
+            # "shared": head emits d_sine + 2 scalars per token — a d_sine-dim
+            #   amplitude vector plus a single shared (f, φ); a true
+            #   multi-dimensional sine f(t) = A·sin(ωt + φ).
+            self.shared_sine = getattr(cfg, "sine_param_mode", "independent") == "shared"
+            head_out = (cfg.d_sine + 2) if self.shared_sine else (3 * cfg.d_sine)
             self.head = nn.Sequential(
                 nn.LayerNorm(cfg.d_model),
                 nn.Linear(cfg.d_model, cfg.d_model),
                 nn.GELU(),
                 nn.Linear(cfg.d_model, cfg.d_model),
                 nn.GELU(),
-                nn.Linear(cfg.d_model, 3 * cfg.d_sine),
+                nn.Linear(cfg.d_model, head_out),
             )
         else:
             self.head = None
@@ -115,15 +120,32 @@ class SpectralEncoder(nn.Module):
         cfg = self.cfg
         B, L = tokens.shape
         h, _ = self._encode_hidden(tokens, pad_mask)
-        raw = self.head(h).view(B, L, 3, cfg.d_sine)
-        raw_A, raw_f, raw_phi = raw.unbind(-2)  # each (B, L, d_sine)
         real_lengths = (~pad_mask).sum(dim=-1) if pad_mask is not None else None
-        f_bias = f_init_bias(
-            L, cfg.d_sine, cfg.f_bias_spread, tokens.device, raw_f.dtype, real_lengths=real_lengths
-        )
+        if self.shared_sine:
+            # d_sine amplitudes + one shared (f, φ) per token slot.
+            raw = self.head(h)  # (B, L, d_sine + 2)
+            raw_A = raw[..., : cfg.d_sine]                       # (B, L, d_sine)
+            raw_f = raw[..., cfg.d_sine : cfg.d_sine + 1]        # (B, L, 1)
+            raw_phi = raw[..., cfg.d_sine + 1 : cfg.d_sine + 2]  # (B, L, 1)
+            # One frequency per token slot → spread the init bias over L slots
+            # (d_sine=1) so it broadcasts across the shared channels.
+            f_bias = f_init_bias(
+                L, 1, cfg.f_bias_spread, tokens.device, raw_f.dtype, real_lengths=real_lengths
+            )
+        else:
+            raw = self.head(h).view(B, L, 3, cfg.d_sine)
+            raw_A, raw_f, raw_phi = raw.unbind(-2)  # each (B, L, d_sine)
+            f_bias = f_init_bias(
+                L, cfg.d_sine, cfg.f_bias_spread, tokens.device, raw_f.dtype, real_lengths=real_lengths
+            )
         A = F.softplus(raw_A).clamp(max=cfg.A_max)
         f = cfg.f_min + (cfg.f_max - cfg.f_min) * torch.sigmoid(raw_f + f_bias)
         phi = 2 * math.pi * torch.sigmoid(raw_phi)
+        if self.shared_sine:
+            # Broadcast the shared frequency/phase across all d_sine channels so
+            # everything downstream sees the usual (B, L, d_sine) shapes.
+            f = f.expand(B, L, cfg.d_sine)
+            phi = phi.expand(B, L, cfg.d_sine)
         if pad_mask is not None:
             keep = (~pad_mask).to(A.dtype).unsqueeze(-1)  # (B, L, 1)
             A = A * keep
@@ -145,6 +167,18 @@ def synthesize(A, f, phi, n_samples: int, duration: float):
     # sum over tokens (L axis) → (B, d_sine, N), then move N to seq dim
     signal = (A.unsqueeze(-1) * torch.sin(arg)).sum(dim=1)  # (B, d_sine, N)
     return signal.transpose(-1, -2).contiguous()  # (B, N, d_sine)
+
+
+def freqs_for_separation(f, cfg):
+    """Flatten the (B, L, d_sine) frequency tensor for the separation penalty.
+
+    "independent" mode: every (slot, channel) wave is distinct, so flatten all
+    L·d_sine of them. "shared" mode: the d_sine channels of a slot share one
+    frequency, so collapse to the L distinct per-token frequencies — flattening
+    the duplicates would penalize them as zero-separation pairs."""
+    if getattr(cfg, "sine_param_mode", "independent") == "shared":
+        return f[..., 0]  # (B, L)
+    return f.flatten(1, 2)  # (B, L·d_sine)
 
 
 def freq_separation_loss(f, min_sep: float):
@@ -220,5 +254,5 @@ class SpectralAE(nn.Module):
         # token. Without this, distinct channels could collapse to identical
         # frequencies and waste capacity.
         min_sep = cfg.freq_sep_min_bins / cfg.duration
-        aux = freq_separation_loss(f.flatten(1, 2), min_sep)
+        aux = freq_separation_loss(freqs_for_separation(f, cfg), min_sep)
         return logits, tokens, aux

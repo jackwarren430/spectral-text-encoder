@@ -1,5 +1,6 @@
 /checkpoints
 /all-training
 /visualizations
+/pace-ice-runs
 *.pyc
 *.pt
