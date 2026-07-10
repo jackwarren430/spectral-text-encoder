@@ -20,10 +20,14 @@ against conventional pooled-embedding baselines. All Spearman/Pearson numbers ar
   model is far more additive than the fully-trained best model.
 - Capacity scales cleanly with `d_sine` (the intended bottleneck knob): val retrieval
   accuracy 66% → 76% → 78% for d_sine 2 → 4 → 6 at BERT-base scale.
-- The June pivot to `sine_param_mode="shared"` with `d_sine=512, n_samples=512`
-  (`all-training/e2e-train/`) **failed to train** (val acc stuck ≈4%). Note its config has
-  `f_max=960` with Nyquist = 512/(2·1.0) = 256 Hz — a silent-aliasing violation of the
-  known foot-gun, which is a plausible cause and worth fixing before re-judging that idea.
+- The June `sine_param_mode="shared"` experiments (one shared (f, φ) per token, d_sine
+  amplitudes — a single multi-dimensional signal instead of d_sine independent sines) were
+  **AE-reconstruction runs (`train.py`), all stopped early or stalled**. The longest run
+  (d_sine=512, n_samples=512) plateaued at exactly unigram-entropy CE — the decoder learned
+  token frequencies and got nothing from the waveform — but its config also violates
+  Nyquist (`f_max=960` vs 256 Hz), so it isn't a clean verdict. The two Nyquist-safe shared
+  runs were killed at 50 and 1400 steps. Shared mode is **untested, not refuted** — and it
+  has never been tried in CLIP mode at all.
 
 ## Best model — `all-training/runpod-breakthrough/good-run/step_38000.pt`
 
@@ -169,16 +173,38 @@ What actually ran on PACE-ICE (`pace-ice-runs/all-training/`):
   headers only (jobs died before step 50, likely during dataset cache build). The
   recon-auxiliary question is still open.
 
-## Failed / open: June end-to-end runs (`all-training/e2e-train/`)
+## Open: shared-sine mode (`all-training/e2e-train/`, 2026-06-01)
 
-The 2026-06-01 runs pivoted to `sine_param_mode="shared"` (one (f, φ) per token, d_sine
-amplitudes) with `d_sine=512` and `n_samples=512`. All runs stalled: val loss plateaued
-≈7.5 with ~4% retrieval accuracy at 11k+ steps.
+`sine_param_mode="shared"` changes the representation from d_sine independent sine
+channels to **one multi-dimensional signal**: each token emits a single shared (f, φ)
+plus d_sine amplitudes, so its contribution to every channel is the same sine, scaled.
+Five AE-reconstruction runs (`train.py`, 512d/8L encoder, batch 128) tried it on 06-01;
+none got a fair shake:
 
-Before concluding the shared parametrization is at fault: the config kept `f_max=960`
-while `n_samples=512, duration=1.0` puts Nyquist at **256 Hz** — most of the frequency
-band aliases silently (the exact foot-gun documented in CLAUDE.md). Rerunning with
-`f_max ≤ ~240` (or `n_samples` back at 2048) is the first thing to try.
+| run | d_sine | n_samples | Nyquist OK? | outcome |
+|---|---|---|---|---|
+| 17-29-58 | 6 | 2048 | yes | aborted at step 50 (~131 s/step — impractically slow on that machine) |
+| 20-35-51 | 5 | 2048 | yes | killed at step 1400: CE 58 → 13.5, token acc 2.2% |
+| 23-10-46 | 512 | 1028 | no (f_max 960 > 514) | died before logging |
+| 23-41-58 | 512 | 512 | no (f_max 960 > 256) | died at step 50 |
+| 23-44-54 | 512 | 512 | no (f_max 960 > 256) | ran 11.8k steps; **plateaued at CE ≈ 7.5, token acc ≈ 4.4%** |
+
+Observations, not verdicts:
+
+- The long aliased run's CE plateau ≈ 7.5 is right at WikiText unigram entropy — the
+  decoder learned token frequencies and extracted **nothing** from the waveform. With
+  `f_max=960` against a 256 Hz Nyquist limit, most of the band aliases silently (the
+  documented foot-gun), so this run can't condemn the shared parametrization.
+- The Nyquist-safe d_sine=5 run was still above uniform CE (ln 50257 ≈ 10.8 → 13.5) at
+  step 1400 but falling steadily when killed. Also note every shared run starts at CE
+  250–300, vs ~22 for independent mode — the shared head's init geometry produces huge
+  confident-wrong logits, which alone could explain a much slower warmup. Worth fixing
+  init (or lowering `A_max`/warmup lr) before judging.
+- No shared-mode **CLIP** run was ever started (the configured
+  `clip_ckpt_dir=all-training/shared/test-1/` was never created).
+
+Next steps if revisiting: shared mode, `n_samples=2048` (or `f_max ≤ 240`), fixed init,
+and let it run past ~10k steps; then the same in CLIP mode.
 
 ## Reproducing the numbers
 
