@@ -1,0 +1,198 @@
+# Results
+
+State of the project as of 2026-07-10. Covers the best CLIP-trained spectral models, the
+compositionality (additivity) experiments, STS Spearman evaluations, and the comparison
+against conventional pooled-embedding baselines. All Spearman/Pearson numbers are ×100
+(the standard convention). STS evals were run 2026-07-10 with `eval_spearman.py`
+(which now forces `sine_param_mode="independent"` for checkpoints that predate that field).
+
+## TL;DR
+
+- The spectral method **works**: a sum-of-sines waveform used directly as a sentence
+  embedding reaches **62.3 Spearman on STS-B** (50.2 avg across STS12–16 + STS-B + SICK-R),
+  trained only with in-batch InfoNCE on ~547k NLI/Quora/Altlex pairs.
+- Conventional pooling heads on the *same* BERT-base trunk score higher (STS-B ~69–70,
+  avg ~61–63), so the waveform bottleneck currently costs ~7–8 STS-B points — the price
+  of forcing everything through `L·d_sine` (A, f, φ) triples.
+- Embeddings are **directionally additive but not literally additive**:
+  `wave(a) + wave(b)` points the same way as `wave("a b")` (cosine 0.92–0.98) but differs
+  substantially in magnitude/detail (relative L2 0.4–1.2). An early, high per-channel-loss
+  model is far more additive than the fully-trained best model.
+- Capacity scales cleanly with `d_sine` (the intended bottleneck knob): val retrieval
+  accuracy 66% → 76% → 78% for d_sine 2 → 4 → 6 at BERT-base scale.
+- The June pivot to `sine_param_mode="shared"` with `d_sine=512, n_samples=512`
+  (`all-training/e2e-train/`) **failed to train** (val acc stuck ≈4%). Note its config has
+  `f_max=960` with Nyquist = 512/(2·1.0) = 256 Hz — a silent-aliasing violation of the
+  known foot-gun, which is a plausible cause and worth fixing before re-judging that idea.
+
+## Best model — `all-training/runpod-breakthrough/good-run/step_38000.pt`
+
+The "breakthrough" RunPod run (2026-05-12), still the best spectral checkpoint.
+
+| | |
+|---|---|
+| Architecture | encoder d_model 512, 8 layers, 8 heads, FFN 2048 (~51.5M params); `d_sine=6`, `n_samples=2048`, independent (A, f, φ) triples |
+| Embedding | flattened waveform, 2048 × 6 = 12,288 dims, L2-normalized (`clip_embedding_type="time"`) |
+| Training | symmetric InfoNCE, batch 512, lr 1.5e-4, per-channel InfoNCE λ=0.1, freq-sep λ=0.05, ~39k steps on all-nli + quora-duplicates + altlex (547k pairs) |
+| Val retrieval | **80.3%** top-1 in-batch accuracy @ batch 512 (train acc ~92%) |
+
+STS suite (Spearman / Pearson):
+
+| dataset | Spearman | Pearson |
+|---|---|---|
+| STS12 | 42.66 | 45.15 |
+| STS13 | 36.83 | 35.11 |
+| STS14 | 37.56 | 38.35 |
+| STS15 | 50.62 | 45.97 |
+| STS16 | 59.66 | 55.02 |
+| **STS-B (test)** | **62.27** | 62.60 |
+| SICK-R | 61.78 | 73.19 |
+| **average** | **50.20** | 50.77 |
+
+For calibration: random embeddings sit near 0, unsupervised GloVe-mean ≈ 40–55 avg, and
+contrastively trained BERT-scale baselines (SimCSE-class) sit ≈ 76–82 avg. A 6-channel
+waveform bottleneck holding 50 avg / 62 STS-B is the core "this actually works" result.
+
+## Two other notable models
+
+### 1. `pace-ice-runs/.../comparison-test/bert_arch_dsine_2_low_lr/.../step_26000.pt` — the extreme bottleneck
+
+BERT-base trunk (768d / 12L / 12H, FFN 3072) but only **2 sine channels** — every token
+contributes just 6 scalars (2 × (A, f, φ)) to the summed waveform, and the whole sentence
+must survive as a 2-channel signal.
+
+- Val retrieval 72.0% @ batch 512 (26k steps; the lr 3e-4 twin was unstable, this 1.5e-4
+  version kept climbing).
+- **STS-B Spearman 56.7** — it retains ~91% of the best model's STS-B score with **one third**
+  of the bottleneck width. Together with the d_sine sweep (below) this is the cleanest
+  evidence that `d_sine` behaves like a real information-capacity knob rather than just a
+  parameter count.
+
+### 2. `all-training/runpod-2/step_4000.pt` — the (nearly) additive encoder
+
+Deeper spectral encoder (512d / 12L, `d_sine=8`) trained with a much stronger per-channel
+InfoNCE weight (λ=0.5 vs 0.1) and freq-sep λ=0.1, only 5.7k steps in (val acc 56.6%).
+
+- **STS-B Spearman 37.1** — semantically much weaker than the best model.
+- But it is by far the most *compositional* checkpoint measured: `wave(a)+wave(b)` lands
+  ~2× closer to `wave("a b")` than the best model manages (rel. L2 ≈ 0.42 vs ≈ 0.85, see
+  next section), and its per-channel plots show clean, low-frequency, near-superposable
+  waves. This is the existence proof for the "embeddings you can add like signals" goal,
+  and it suggests additivity is trainable (heavier per-channel loss, earlier in training)
+  but currently trades off against raw STS quality.
+
+Honorable mention: `pace-ice-runs/.../comparison-test/bert_arch_dsine_6/.../step_22000.pt`
+(BERT-base trunk, d_sine=6) — STS avg 48.9 / STS-B 60.7, i.e. **scaling the trunk from 51M to
+110M params bought nothing**. The bottleneck, not the encoder, is what limits quality —
+consistent with the architectural premise.
+
+## Compositionality: is `wave(a) + wave(b) ≈ wave("a b")`?
+
+`compositionality_test.py` encodes each sentence of a pair separately, sums the two
+waveforms, and compares against the waveform of the concatenated sentence, over 10 pairs
+in three categories (paraphrase-related, unrelated, interacting/coreferent). Outputs live
+in `experiments/spectral_compositionality_*/`.
+
+| model | category | avg rel. L2 ↓ | avg cosine ↑ |
+|---|---|---|---|
+| best model (step 38000) | related | 0.849 | 0.962 |
+| | unrelated | 0.769 | 0.945 |
+| | interacting | 0.916 | 0.950 |
+| runpod-2 (step 4000) | related | 0.459 | 0.917 |
+| | unrelated | 0.397 | 0.947 |
+| | interacting | 0.410 | 0.926 |
+
+Readings:
+
+- **Direction is preserved, detail is not.** Cosine similarity between the sum and the
+  joint waveform is 0.92–0.98 everywhere, but the residual carries 40–125% of the joint
+  signal's energy. Adding embeddings gets you "about the right meaning region," not the
+  exact embedding of the concatenation.
+- **Context-dependence shows up where it should.** For the mature model, *interacting*
+  pairs (coreference/causal: "The temperature dropped sharply." / "Everyone reached for
+  warm clothes.") diverge most (rel. L2 up to 1.25) — the encoder's cross-sentence
+  attention genuinely changes the waves when the sentences interact. Unrelated pairs are
+  the most additive, as superposition would predict.
+- **Training toward retrieval erodes additivity.** The early/high-per-channel-λ runpod-2
+  checkpoint is roughly twice as additive as the fully trained best model across every
+  category. The per-channel plots make this visible: runpod-2's channels are smooth
+  near-single sines that overlay cleanly; the best model's high-frequency channels
+  (ch 3–5) show large amplitude mismatches between sum and joint.
+
+## Comparison to conventional embedding methods
+
+Controlled comparison on the **same BERT-base trunk, same data, same InfoNCE loss** —
+the only change is the head: spectral waveform vs standard pooling (`clip_encoder_mode`
+∈ mean_pool / max_pool / cls). Baselines trained at batch 1024 (a *harder* in-batch
+retrieval task) and converged in far fewer steps.
+
+| model (head) | emb. dims | steps | val acc | STS-B ρ | STS avg ρ |
+|---|---|---|---|---|---|
+| max-pool | 768 | 6k | 89.0% @1024 | **70.38** | **63.09** |
+| mean-pool | 768 | 6k | 88.9% @1024 | 69.07 | 62.07 |
+| CLS token | 768 | 2k | 87.7% @1024 | 67.69 | 60.72 |
+| spectral d_sine=6 (BERT trunk) | 12,288 | 22k | 78.1% @512 | 60.73 | 48.93 |
+| spectral d_sine=4 (BERT trunk) | 8,192 | 22k | 75.7% @512 | 60.87 | — |
+| spectral d_sine=2 (BERT trunk, low lr) | 4,096 | 26k | 72.0% @512 | 56.68 | — |
+| **best spectral (512d/8L trunk)** | 12,288 | 38k | 80.3% @512 | 62.27 | 50.20 |
+
+Takeaways:
+
+- Pooling wins on raw quality by ~7–8 STS-B points / ~13 avg points, while also training
+  ~4× faster. Expected: pooling reads the full 768-d hidden state; the spectral head must
+  squeeze everything through per-token sine triples and a per-channel sum.
+- The gap is mostly on the older STS12–14 sets; on SICK-R the spectral models actually
+  match or beat the baselines (spectral d_sine=6: 63.1 vs max-pool 64.7, and it *beats*
+  mean-pool's 64.9 → best spectral 61.8 is close). The bottleneck hurts fine-grained
+  lexical similarity more than entailment-flavored similarity.
+- What the baselines don't have: a physically structured, additive-ish, per-channel
+  interpretable representation. The compositionality results above only exist for the
+  spectral head.
+
+## The larger pace-ice runs (2026-05-15 → 05-16)
+
+What actually ran on PACE-ICE (`pace-ice-runs/all-training/`):
+
+- **`comparison-test/bert_arch_dsine_{2,4,6}`** — d_sine sweep at BERT-base scale,
+  batch 512, lr 3e-4 (plus a 1.5e-4 rerun for d_sine=2). Result: monotone capacity
+  scaling (val acc 66.1% / 75.7% / 78.1% for 2/4/6). d_sine=6 at lr 3e-4 destabilized
+  after ~22k steps (val acc dropped 78% → 73.7%); the surviving checkpoints are from
+  before the blow-up.
+- **`comparison-test/high_aux_loss{,_dsine_2}`** — freq-sep λ=0.2 + per-channel λ=0.8 at
+  batch 1024. Only reached ~7k steps (66.9% / 42.1% val acc); inconclusive, but on-trend
+  with "heavier auxiliary pressure slows retrieval quality" (cf. runpod-2's additivity
+  trade-off).
+- **`{mean,max}-pool` and `cls` baselines** — the comparison table above; each kept a
+  single checkpoint (6k / 6k / 2k steps).
+- **`reconstruction-loss/{05,10}_lambda`** — the recon-CE auxiliary (`clip_recon_lambda`
+  0.05 / 0.1) experiments **never produced data**: all eight metrics.csv files contain
+  headers only (jobs died before step 50, likely during dataset cache build). The
+  recon-auxiliary question is still open.
+
+## Failed / open: June end-to-end runs (`all-training/e2e-train/`)
+
+The 2026-06-01 runs pivoted to `sine_param_mode="shared"` (one (f, φ) per token, d_sine
+amplitudes) with `d_sine=512` and `n_samples=512`. All runs stalled: val loss plateaued
+≈7.5 with ~4% retrieval accuracy at 11k+ steps.
+
+Before concluding the shared parametrization is at fault: the config kept `f_max=960`
+while `n_samples=512, duration=1.0` puts Nyquist at **256 Hz** — most of the frequency
+band aliases silently (the exact foot-gun documented in CLAUDE.md). Rerunning with
+`f_max ≤ ~240` (or `n_samples` back at 2048) is the first thing to try.
+
+## Reproducing the numbers
+
+```bash
+# STS suite for any CLIP checkpoint (add --all for the full 7-dataset suite)
+conda run -n dl python eval_spearman.py all-training/runpod-breakthrough/good-run/step_38000.pt --all
+
+# Compositionality test (spectral checkpoints only)
+conda run -n dl python compositionality_test.py all-training/runpod-breakthrough/good-run/step_38000.pt
+
+# Pairwise similarity sanity check
+conda run -n dl python infer_clip.py all-training/runpod-breakthrough/good-run/step_38000.pt \
+    --text-a "The cat sat on the mat." --text-b "A feline rested on the rug."
+```
+
+Raw eval logs from the 2026-07-10 sweep are reproduced by the commands above; training
+metrics for every run are in each run directory's `metrics.csv` / `loss.png` / `acc.png`.

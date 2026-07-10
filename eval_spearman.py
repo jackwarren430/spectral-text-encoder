@@ -110,6 +110,10 @@ def main():
     print(f"[eval] device={device}  ckpt={args.ckpt}")
     blob = torch.load(args.ckpt, map_location=device, weights_only=False)
     cfg = Config(**blob["cfg"])
+    if "sine_param_mode" not in blob["cfg"]:
+        # Checkpoints predating sine_param_mode were trained with d_sine
+        # independent (A, f, φ) triples; the current default is "shared".
+        cfg.sine_param_mode = "independent"
     if args.embedding_type is not None:
         cfg.clip_embedding_type = args.embedding_type
         print(f"[eval] overriding clip_embedding_type → {cfg.clip_embedding_type}")
