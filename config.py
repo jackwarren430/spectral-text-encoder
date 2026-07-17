@@ -20,7 +20,7 @@ class Config:
     # per-token sine-wave channel count: each of the L encoder slots emits
     # d_sine independent (A, f, φ) triples. The decoder consumes the summed
     # multi-channel waveform directly (no FFT round-trip).
-    d_sine: int = 512
+    d_sine: int = 6
     # Sine parameterization per token slot:
     #   "independent" (default): each slot emits d_sine independent (A, f, φ)
     #     triples — d_sine separate single-channel waves.
@@ -30,10 +30,10 @@ class Config:
     #     emits d_sine + 2 scalars per slot instead of 3·d_sine. Everything
     #     downstream (synthesize, decoder, embeddings) is unchanged because f
     #     and φ are broadcast to (B, L, d_sine) before synthesis.
-    sine_param_mode: str = "shared"
+    sine_param_mode: str = "independent"
 
     # signal / FFT
-    n_samples: int = 512
+    n_samples: int = 2048
     duration: float = 1.0
     f_min: float = 1.0
     f_max: float = 960.0  # Nyquist = n_samples / (2*duration) = 1024; leave margin
@@ -76,22 +76,30 @@ class Config:
     # raising peak memory. Note: this does NOT give more in-batch negatives —
     # each mini-batch still computes its loss against its own (B-1) negatives.
     clip_grad_accum_steps: int = 1
-    clip_lr: float = 3e-4 
+    # 3e-4 destabilized d_sine=6 after ~22k steps (pace-ice sweep); 1.5e-4
+    # produced the best checkpoint and was still climbing at 38k.
+    clip_lr: float = 1.5e-4
     clip_warmup_steps: int = 3000
-    clip_max_steps: int = 100000
+    # 50k so the cosine schedule actually completes — the 38k best model
+    # stopped mid-schedule (100k horizon) with the lr still high.
+    clip_max_steps: int = 50000
     clip_logit_scale_init: float = 2.6593 # ln(1/0.07) — CLIP default
     clip_logit_scale_max: float = 4.6052  # ln(100) — clamp ceiling per CLIP
     clip_log_every: int = 100
     clip_val_every: int = 1000
     clip_val_batches: int = 50
     clip_ckpt_every: int = 2000
-    clip_ckpt_dir: str = "all-training/shared/test-1/"
+    clip_ckpt_dir: str = "all-training/freq-fix-d6/"
     # Gradient caching (Gao et al. 2021). When set and < clip_batch_size, the
     # contrastive loss is computed across the full clip_batch_size of negatives
     # while only chunk_size examples are forwarded with grad at a time. Lets
     # you raise clip_batch_size (more negatives) without raising peak memory.
     # None disables (single forward pass, current behavior).
-    clip_cache_chunk_size: int = 32
+    # chunk == batch also disables it (direct mode) — the right setting on
+    # large-memory boxes (DGX Spark 128 GB): one fewer forward pass per step.
+    # Set back to 32 for memory-constrained machines, or raise clip_batch_size
+    # above this to re-enable chunking automatically.
+    clip_cache_chunk_size: int = 512
     # Multi-source contrastive mix. Each entry is (hf_dataset_name, config_name);
     # use "" for datasets without a config. When non-empty, this overrides the
     # legacy single-source clip_dataset_name / clip_dataset_config. Empty tuple
@@ -118,7 +126,7 @@ class Config:
     # a contrastive loss using just that channel's slice of the signal and
     # average across channels. Pushes the encoder to keep channels distinct,
     # directly attacking the d_sine-collapse failure mode. 0 disables.
-    clip_per_channel_lambda: float = 0.0
+    clip_per_channel_lambda: float = 0.1
     # Reconstruction auxiliary loss. Runs the decoder on the synthesized
     # waveform and computes CE against the input tokens (AE-mode objective) on
     # both anchor and positive sides. Decoder params join the optimizer when

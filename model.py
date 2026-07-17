@@ -169,28 +169,49 @@ def synthesize(A, f, phi, n_samples: int, duration: float):
     return signal.transpose(-1, -2).contiguous()  # (B, N, d_sine)
 
 
-def freqs_for_separation(f, cfg):
+def freqs_for_separation(f, cfg, pad_mask=None):
     """Flatten the (B, L, d_sine) frequency tensor for the separation penalty.
 
     "independent" mode: every (slot, channel) wave is distinct, so flatten all
     L·d_sine of them. "shared" mode: the d_sine channels of a slot share one
     frequency, so collapse to the L distinct per-token frequencies — flattening
-    the duplicates would penalize them as zero-separation pairs."""
+    the duplicates would penalize them as zero-separation pairs.
+
+    Returns (freqs, valid) with freqs (B, K) and valid (B, K) bool (True at
+    real slots), or valid=None when pad_mask is None. Pad slots MUST be
+    excluded from the penalty: their f_bias saturates them at ≈ f_max, so they
+    would add a large zero-gradient pad–pad penalty floor, spuriously repel
+    real high-band frequencies, and dilute the per-pair normalization by
+    ~(L_max/len)² for short rows."""
     if getattr(cfg, "sine_param_mode", "independent") == "shared":
-        return f[..., 0]  # (B, L)
-    return f.flatten(1, 2)  # (B, L·d_sine)
+        valid = None if pad_mask is None else ~pad_mask
+        return f[..., 0], valid  # (B, L)
+    # flatten(1, 2) is slot-major (index = l·d_sine + c); repeat_interleave
+    # along dim 1 matches that ordering.
+    valid = None if pad_mask is None else (~pad_mask).repeat_interleave(f.size(-1), dim=1)
+    return f.flatten(1, 2), valid  # (B, L·d_sine)
 
 
-def freq_separation_loss(f, min_sep: float):
+def freq_separation_loss(f, min_sep: float, valid=None):
     """Hinge penalty on too-close pairs of predicted frequencies.
 
-    f: (B, K). Returns a scalar averaged over off-diagonal pairs and batch.
+    f: (B, K); valid: optional (B, K) bool, True at real slots — pairs touching
+    an invalid (pad) slot are excluded. Per-row mean over counted pairs, then
+    mean over rows, so every row weighs equally regardless of real length and
+    chunked evaluation (GradCache) recombines to exactly the full-batch value.
+    Reduces to the plain all-pairs average when valid is None.
     """
     diff = (f.unsqueeze(-1) - f.unsqueeze(-2)).abs()  # (B, K, K)
     K = f.size(-1)
     eye = torch.eye(K, dtype=torch.bool, device=f.device)
     penalty = torch.relu(min_sep - diff).masked_fill(eye, 0.0)
-    return penalty.sum() / (f.size(0) * K * (K - 1))
+    if valid is None:
+        return penalty.sum() / (f.size(0) * K * (K - 1))
+    pair_ok = valid.unsqueeze(-1) & valid.unsqueeze(-2)
+    penalty = penalty.masked_fill(~pair_ok, 0.0)
+    n_real = valid.sum(-1).to(f.dtype)
+    n_pairs = (n_real * (n_real - 1)).clamp(min=1.0)  # (B,)
+    return (penalty.sum(dim=(-1, -2)) / n_pairs).mean()
 
 
 class WaveformDecoder(nn.Module):
@@ -254,5 +275,6 @@ class SpectralAE(nn.Module):
         # token. Without this, distinct channels could collapse to identical
         # frequencies and waste capacity.
         min_sep = cfg.freq_sep_min_bins / cfg.duration
-        aux = freq_separation_loss(freqs_for_separation(f, cfg), min_sep)
+        fk, _ = freqs_for_separation(f, cfg)  # AE batches are unpadded
+        aux = freq_separation_loss(fk, min_sep)
         return logits, tokens, aux

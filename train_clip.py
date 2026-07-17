@@ -202,7 +202,25 @@ def validate_pooled(model, loader, logit_scale, device, cfg: Config, max_batches
         "pc": 0.0,
         "recon": 0.0,
         "acc": total_correct / n,
+        "sat": 0.0,
+        "mid": 0.0,
     }
+
+
+def _freq_health(fk, valid, cfg: Config):
+    """Frequency-collapse counters over one batch side.
+
+    fk: (B, K) frequencies from freqs_for_separation; valid: matching real-slot
+    mask (None = all real). Returns (n_saturated, n_mid_band, n_waves) where
+    "saturated" means |pre-sigmoid| > 4 (within ~1.8% of a band edge, so the
+    f gradient is attenuated ~50×+) and "mid band" means more than 20 Hz from
+    both edges. Healthy separation = sat falling, mid rising."""
+    vals = fk[valid] if valid is not None else fk.reshape(-1)
+    p = (vals - cfg.f_min) / (cfg.f_max - cfg.f_min)
+    pre = torch.logit(p, eps=1e-7)
+    n_sat = (pre.abs() > 4.0).sum().item()
+    n_mid = ((vals > cfg.f_min + 20.0) & (vals < cfg.f_max - 20.0)).sum().item()
+    return n_sat, n_mid, vals.numel()
 
 
 @torch.no_grad()
@@ -217,6 +235,7 @@ def validate(model, loader, logit_scale, device, cfg: Config, max_batches: int, 
     total_recon = 0.0
     total_correct = 0
     total = 0
+    total_sat = total_mid = total_waves = 0
     for i, batch in enumerate(loader):
         if i >= max_batches:
             break
@@ -226,10 +245,17 @@ def validate(model, loader, logit_scale, device, cfg: Config, max_batches: int, 
         emb_a = signal_to_embedding(sig_a, cfg)
         emb_b = signal_to_embedding(sig_b, cfg)
         loss_ce, logits = contrastive_loss(emb_a, emb_b, logit_scale)
+        fka, va = freqs_for_separation(fa, cfg, ma)
+        fkb, vb = freqs_for_separation(fb, cfg, mp)
         aux = 0.5 * (
-            freq_separation_loss(freqs_for_separation(fa, cfg), min_sep)
-            + freq_separation_loss(freqs_for_separation(fb, cfg), min_sep)
+            freq_separation_loss(fka, min_sep, va)
+            + freq_separation_loss(fkb, min_sep, vb)
         )
+        for fk, valid in [(fka, va), (fkb, vb)]:
+            n_sat, n_mid, n_waves = _freq_health(fk, valid, cfg)
+            total_sat += n_sat
+            total_mid += n_mid
+            total_waves += n_waves
         bs = emb_a.size(0)
         total_ce += loss_ce.item() * bs
         total_aux += aux.item() * bs
@@ -246,12 +272,15 @@ def validate(model, loader, logit_scale, device, cfg: Config, max_batches: int, 
         total += bs
     model.train()
     n = max(1, total)
+    nw = max(1, total_waves)
     return {
         "ce": total_ce / n,
         "aux": total_aux / n,
         "pc": total_pc / n,
         "recon": total_recon / n,
         "acc": total_correct / n,
+        "sat": total_sat / nw,
+        "mid": total_mid / nw,
     }
 
 
@@ -268,9 +297,11 @@ def micro_step_direct(model, batch, logit_scale, cfg, accum, min_sep, device):
     emb_b = signal_to_embedding(sig_b, cfg)
     loss_ce, logits = contrastive_loss(emb_a, emb_b, logit_scale)
 
+    fka, va = freqs_for_separation(fa, cfg, ma)
+    fkb, vb = freqs_for_separation(fb, cfg, mp)
     aux = 0.5 * (
-        freq_separation_loss(freqs_for_separation(fa, cfg), min_sep)
-        + freq_separation_loss(freqs_for_separation(fb, cfg), min_sep)
+        freq_separation_loss(fka, min_sep, va)
+        + freq_separation_loss(fkb, min_sep, vb)
     )
     pc = sig_a.new_zeros(())
     if cfg.clip_per_channel_lambda > 0:
@@ -359,9 +390,11 @@ def micro_step_grad_cache(model, batch, logit_scale, cfg, accum, min_sep, device
         _restore_rng(rng_states[i], device)
         sig_a, fa = encode_to_signal(model, ta[s:e], ma[s:e], cfg)
         sig_b, fb = encode_to_signal(model, tp[s:e], mp[s:e], cfg)
+        fka, va = freqs_for_separation(fa, cfg, ma[s:e])
+        fkb, vb = freqs_for_separation(fb, cfg, mp[s:e])
         aux_chunk = 0.5 * (
-            freq_separation_loss(freqs_for_separation(fa, cfg), min_sep)
-            + freq_separation_loss(freqs_for_separation(fb, cfg), min_sep)
+            freq_separation_loss(fka, min_sep, va)
+            + freq_separation_loss(fkb, min_sep, vb)
         )
         n_chunk = e - s
         aux_weighted_sum += aux_chunk.item() * n_chunk
@@ -667,6 +700,7 @@ def train(cfg: Config, run_dir: str, resume_ckpt: str | None):
                 vextras = ""
                 if spectral_mode:
                     vextras += f" | aux {v['aux']:.4f}"
+                    vextras += f" | sat {v['sat']*100:.1f}% | mid {v['mid']*100:.1f}%"
                 if cfg.clip_per_channel_lambda > 0:
                     vextras += f" | pc {v['pc']:.4f}"
                 if cfg.clip_recon_lambda > 0:
@@ -680,6 +714,7 @@ def train(cfg: Config, run_dir: str, resume_ckpt: str | None):
                     loss=f"{v['ce']:.6f}", acc=f"{v['acc']:.6f}",
                     aux=f"{v['aux']:.6f}", ce=f"{v['ce']:.6f}",
                     pc=f"{v['pc']:.6f}", recon=f"{v['recon']:.6f}",
+                    sat=f"{v['sat']:.6f}", mid=f"{v['mid']:.6f}",
                     scale=f"{logit_scale.exp().item():.4f}",
                 )
 

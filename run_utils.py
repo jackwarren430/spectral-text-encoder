@@ -73,7 +73,7 @@ class MetricsLogger:
     """Append-only CSV. One row per train log interval and per val event."""
 
     FIELDS = ["step", "event", "loss", "acc", "lr", "gnorm", "scale", "aux", "ce",
-              "pc", "recon", "ms_per_step"]
+              "pc", "recon", "sat", "mid", "ms_per_step"]
 
     def __init__(self, run_dir: str):
         self.path = os.path.join(run_dir, "metrics.csv")
