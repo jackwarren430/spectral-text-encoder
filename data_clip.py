@@ -12,8 +12,10 @@ _PAIR_COLUMN_CANDIDATES = [
     ("anchor", "positive"),
     ("sentence1", "sentence2"),
     ("question1", "question2"),
+    ("title1", "title2"),          # Stack Exchange duplicate titles
+    ("caption1", "caption2"),      # COCO / Flickr same-image captions
     ("premise", "hypothesis"),
-    ("text", "simplified"),  # sentence-transformers/altlex
+    ("text", "simplified"),        # AltLex / sentence compression
 ]
 
 
@@ -77,12 +79,17 @@ def _resolve_specs(cfg):
     return [(cfg.clip_dataset_name, cfg.clip_dataset_config)]
 
 
-def build_pairs(cfg):
-    """Tokenize all configured sources, returning a list of per-source dicts and
-    the shared pad-token id. Each source dict has 'name', 'a', 'p'."""
+def build_pair_sources(specs, tokenizer_name: str, max_len: int, log_prefix="data_clip"):
+    """Build tokenized pair sources for any training objective.
+
+    CLIP and VAE training use the same source data, but keep independent
+    configuration and training entry points.  This small public helper owns the
+    shared tokenization/cache behavior without making the VAE pretend to be a
+    CLIP run.
+    """
     from transformers import AutoTokenizer
 
-    tokenizer = AutoTokenizer.from_pretrained(cfg.tokenizer_name)
+    tokenizer = AutoTokenizer.from_pretrained(tokenizer_name)
     pad_id = tokenizer.pad_token_id
     if pad_id is None:
         # GPT-2 has no pad token; reuse eos. Pad positions are masked out by
@@ -90,11 +97,21 @@ def build_pairs(cfg):
         pad_id = tokenizer.eos_token_id
 
     sources = []
-    for name, dconf in _resolve_specs(cfg):
-        blob = _build_one_source(name, dconf, tokenizer, cfg.tokenizer_name, cfg.clip_max_len)
+    for name, dconf in specs:
+        blob = _build_one_source(name, dconf, tokenizer, tokenizer_name, max_len)
         sources.append({"name": name, "config": dconf, "a": blob["a"], "p": blob["p"]})
-        print(f"[data_clip] {name} ({dconf or 'default'}): {len(blob['a'])} pairs")
-    return sources, int(pad_id)
+        print(f"[{log_prefix}] {name} ({dconf or 'default'}): {len(blob['a'])} pairs")
+    eos_id = tokenizer.eos_token_id
+    return sources, int(pad_id), (None if eos_id is None else int(eos_id))
+
+
+def build_pairs(cfg):
+    """Tokenize all configured sources, returning a list of per-source dicts and
+    the shared pad-token id. Each source dict has 'name', 'a', 'p'."""
+    sources, pad_id, _eos_id = build_pair_sources(
+        _resolve_specs(cfg), cfg.tokenizer_name, cfg.clip_max_len
+    )
+    return sources, pad_id
 
 
 class PairDataset(Dataset):
@@ -138,7 +155,7 @@ class PairCollate:
         return ta, ma, tp, mp
 
 
-def make_clip_loaders(cfg):
+def make_clip_loaders(cfg, device=None):
     sources, pad_id = build_pairs(cfg)
 
     # Hold out cfg.clip_val_frac from EACH source independently so the val set
@@ -170,22 +187,32 @@ def make_clip_loaders(cfg):
     val_ds = PairDataset(val_a, val_p)
 
     collate = PairCollate(pad_id)
+    device_type = str(device or cfg.device).split(":", 1)[0]
+    if device_type == "auto":
+        device_type = "cuda" if torch.cuda.is_available() else "cpu"
+    pin_memory = bool(getattr(cfg, "pin_memory", False) and device_type == "cuda")
+    loader_kwargs = {
+        "num_workers": cfg.num_workers,
+        "collate_fn": collate,
+        "pin_memory": pin_memory,
+    }
+    if cfg.num_workers > 0:
+        loader_kwargs.update(
+            persistent_workers=bool(getattr(cfg, "persistent_workers", False)),
+            prefetch_factor=int(getattr(cfg, "prefetch_factor", 2)),
+        )
     train_loader = DataLoader(
         train_ds,
         batch_size=cfg.clip_batch_size,
         shuffle=True,
-        num_workers=cfg.num_workers,
         drop_last=True,
-        collate_fn=collate,
-        pin_memory=False,
+        **loader_kwargs,
     )
     val_loader = DataLoader(
         val_ds,
         batch_size=cfg.clip_batch_size,
         shuffle=False,
-        num_workers=cfg.num_workers,
         drop_last=True,
-        collate_fn=collate,
-        pin_memory=False,
+        **loader_kwargs,
     )
     return train_loader, val_loader

@@ -21,7 +21,7 @@ def sinusoidal_pe(L: int, d_model: int, device, dtype):
 
 
 def f_init_bias(L: int, d_sine: int, spread: float, device, dtype, real_lengths=None):
-    """Per-(slot, channel) pre-sigmoid bias on the f channel.
+    """Per-(slot, channel) positional bias on the raw frequency output.
 
     Without padding (real_lengths is None): one linspace over L·d_sine slots,
     same for every row. Slot 0 = -spread, slot L·d_sine-1 = +spread.
@@ -42,6 +42,19 @@ def f_init_bias(L: int, d_sine: int, spread: float, device, dtype, real_lengths=
     slot_idx = positions * d_sine + channels  # (1, L, d_sine)
     denom = (real_lengths.to(dtype).view(B, 1, 1) * d_sine - 1).clamp(min=1.0)
     return -spread + 2.0 * spread * slot_idx / denom  # (B, L, d_sine)
+
+
+def frequency_anchors(cfg, device, dtype):
+    """Fixed midpoint anchor for every output channel, shape (d_sine,)."""
+    width = (cfg.f_max - cfg.f_min) / cfg.d_sine
+    channels = torch.arange(cfg.d_sine, device=device, dtype=dtype)
+    return cfg.f_min + (channels + 0.5) * width
+
+
+def frequency_anchor_radius(cfg) -> float:
+    """Maximum local offset from an anchor, in Hz."""
+    width = (cfg.f_max - cfg.f_min) / cfg.d_sine
+    return width * getattr(cfg, "freq_anchor_radius_frac", 0.48)
 
 
 class SpectralEncoder(nn.Module):
@@ -67,6 +80,11 @@ class SpectralEncoder(nn.Module):
             #   amplitude vector plus a single shared (f, φ); a true
             #   multi-dimensional sine f(t) = A·sin(ωt + φ).
             self.shared_sine = getattr(cfg, "sine_param_mode", "independent") == "shared"
+            self.frequency_param_mode = getattr(cfg, "frequency_param_mode", "global")
+            if self.frequency_param_mode == "anchored" and self.shared_sine:
+                raise ValueError(
+                    "anchored frequencies require independent per-channel frequencies"
+                )
             head_out = (cfg.d_sine + 2) if self.shared_sine else (3 * cfg.d_sine)
             self.head = nn.Sequential(
                 nn.LayerNorm(cfg.d_model),
@@ -121,34 +139,51 @@ class SpectralEncoder(nn.Module):
         B, L = tokens.shape
         h, _ = self._encode_hidden(tokens, pad_mask)
         real_lengths = (~pad_mask).sum(dim=-1) if pad_mask is not None else None
-        if self.shared_sine:
-            # d_sine amplitudes + one shared (f, φ) per token slot.
-            raw = self.head(h)  # (B, L, d_sine + 2)
-            raw_A = raw[..., : cfg.d_sine]                       # (B, L, d_sine)
-            raw_f = raw[..., cfg.d_sine : cfg.d_sine + 1]        # (B, L, 1)
-            raw_phi = raw[..., cfg.d_sine + 1 : cfg.d_sine + 2]  # (B, L, 1)
-            # One frequency per token slot → spread the init bias over L slots
-            # (d_sine=1) so it broadcasts across the shared channels.
-            f_bias = f_init_bias(
-                L, 1, cfg.f_bias_spread, tokens.device, raw_f.dtype, real_lengths=real_lengths
-            )
-        else:
-            raw = self.head(h).view(B, L, 3, cfg.d_sine)
-            raw_A, raw_f, raw_phi = raw.unbind(-2)  # each (B, L, d_sine)
-            f_bias = f_init_bias(
-                L, cfg.d_sine, cfg.f_bias_spread, tokens.device, raw_f.dtype, real_lengths=real_lengths
-            )
-        A = F.softplus(raw_A).clamp(max=cfg.A_max)
-        f = cfg.f_min + (cfg.f_max - cfg.f_min) * torch.sigmoid(raw_f + f_bias)
-        phi = 2 * math.pi * torch.sigmoid(raw_phi)
-        if self.shared_sine:
-            # Broadcast the shared frequency/phase across all d_sine channels so
-            # everything downstream sees the usual (B, L, d_sine) shapes.
-            f = f.expand(B, L, cfg.d_sine)
-            phi = phi.expand(B, L, cfg.d_sine)
-        if pad_mask is not None:
-            keep = (~pad_mask).to(A.dtype).unsqueeze(-1)  # (B, L, 1)
-            A = A * keep
+        # The transformer trunk is safe and much faster under CUDA BF16, but a
+        # BF16 frequency near 960 Hz has a several-Hz quantization step. Keep
+        # the small parameter head and waveform parameters in FP32 so mixed
+        # precision cannot erase the very frequency detail this model learns.
+        with torch.autocast(device_type=h.device.type, enabled=False):
+            h = h.float()
+            if self.shared_sine:
+                # d_sine amplitudes + one shared (f, φ) per token slot.
+                raw = self.head(h)  # (B, L, d_sine + 2)
+                raw_A = raw[..., : cfg.d_sine]                       # (B, L, d_sine)
+                raw_f = raw[..., cfg.d_sine : cfg.d_sine + 1]        # (B, L, 1)
+                raw_phi = raw[..., cfg.d_sine + 1 : cfg.d_sine + 2]  # (B, L, 1)
+                # One frequency per token slot → spread the init bias over L slots
+                # (d_sine=1) so it broadcasts across the shared channels.
+                f_bias = f_init_bias(
+                    L, 1, cfg.f_bias_spread, tokens.device, raw_f.dtype,
+                    real_lengths=real_lengths,
+                )
+            else:
+                raw = self.head(h).view(B, L, 3, cfg.d_sine)
+                raw_A, raw_f, raw_phi = raw.unbind(-2)  # each (B, L, d_sine)
+                # Global mode spreads all L*d_sine waves across one band.
+                # Anchored mode spreads the L token waves inside each channel
+                # region, so every channel gets the same position-wise bias.
+                bias_channels = 1 if self.frequency_param_mode == "anchored" else cfg.d_sine
+                f_bias = f_init_bias(
+                    L, bias_channels, cfg.f_bias_spread, tokens.device, raw_f.dtype,
+                    real_lengths=real_lengths,
+                )
+            A = F.softplus(raw_A).clamp(max=cfg.A_max)
+            local_raw_f = raw_f + f_bias
+            if self.frequency_param_mode == "anchored":
+                anchors = frequency_anchors(cfg, tokens.device, raw_f.dtype).view(1, 1, -1)
+                f = anchors + frequency_anchor_radius(cfg) * F.softsign(local_raw_f)
+            else:
+                f = cfg.f_min + (cfg.f_max - cfg.f_min) * torch.sigmoid(local_raw_f)
+            phi = 2 * math.pi * torch.sigmoid(raw_phi)
+            if self.shared_sine:
+                # Broadcast the shared frequency/phase across all d_sine channels so
+                # everything downstream sees the usual (B, L, d_sine) shapes.
+                f = f.expand(B, L, cfg.d_sine)
+                phi = phi.expand(B, L, cfg.d_sine)
+            if pad_mask is not None:
+                keep = (~pad_mask).to(A.dtype).unsqueeze(-1)  # (B, L, 1)
+                A = A * keep
         return A, f, phi
 
 
@@ -169,30 +204,65 @@ def synthesize(A, f, phi, n_samples: int, duration: float):
     return signal.transpose(-1, -2).contiguous()  # (B, N, d_sine)
 
 
-def freqs_for_separation(f, cfg, pad_mask=None):
-    """Flatten the (B, L, d_sine) frequency tensor for the separation penalty.
+def combine_signal_channels(signal, cfg):
+    """Apply the configured observable-channel readout.
 
-    "independent" mode: every (slot, channel) wave is distinct, so flatten all
-    L·d_sine of them. "shared" mode: the d_sine channels of a slot share one
-    frequency, so collapse to the L distinct per-token frequencies — flattening
-    the duplicates would penalize them as zero-separation pairs.
+    Synthesis deliberately remains multichannel so channel-local objectives
+    can inspect the constituent bands. The public symbol is either that
+    multichannel tensor unchanged or a variance-preserving scalar sum.
+    """
+    mode = getattr(cfg, "signal_channel_mode", "multi")
+    if mode == "multi":
+        return signal
+    if mode == "sum":
+        return signal.sum(dim=-1, keepdim=True) / math.sqrt(signal.size(-1))
+    raise ValueError(f"Unknown signal_channel_mode: {mode!r}")
+
+
+def freqs_for_separation(f, cfg, pad_mask=None):
+    """Arrange a (B, L, d_sine) frequency tensor for the separation penalty.
+
+    Anchored mode returns (B*d_sine, L), making each sentence/channel pair one
+    independent separation problem. Equal frequencies in separately observable
+    channels therefore do not collide. Legacy global-independent mode returns
+    (B, L*d_sine). Shared-sine mode returns (B, L), collapsing the duplicated
+    channel frequencies.
 
     Returns (freqs, valid) with freqs (B, K) and valid (B, K) bool (True at
     real slots), or valid=None when pad_mask is None. Pad slots MUST be
-    excluded from the penalty: their f_bias saturates them at ≈ f_max, so they
-    would add a large zero-gradient pad–pad penalty floor, spuriously repel
-    real high-band frequencies, and dilute the per-pair normalization by
-    ~(L_max/len)² for short rows."""
+    excluded from the penalty: they do not contribute to the synthesized
+    signal, so allowing them into the auxiliary objective creates a free path
+    for satisfying it and dilutes normalization for short rows."""
     if getattr(cfg, "sine_param_mode", "independent") == "shared":
         valid = None if pad_mask is None else ~pad_mask
         return f[..., 0], valid  # (B, L)
+    if getattr(cfg, "frequency_param_mode", "global") == "anchored":
+        B, L, D = f.shape
+        freqs = f.transpose(1, 2).reshape(B * D, L)
+        valid = None
+        if pad_mask is not None:
+            valid = (~pad_mask).unsqueeze(1).expand(B, D, L).reshape(B * D, L)
+        return freqs, valid
     # flatten(1, 2) is slot-major (index = l·d_sine + c); repeat_interleave
     # along dim 1 matches that ordering.
     valid = None if pad_mask is None else (~pad_mask).repeat_interleave(f.size(-1), dim=1)
     return f.flatten(1, 2), valid  # (B, L·d_sine)
 
 
-def freq_separation_loss(f, min_sep: float, valid=None):
+_PAIR_INDEX_CACHE = {}
+
+
+def _pair_indices(K: int, device):
+    """Cached upper-triangle indices; avoids materializing a K×K matrix."""
+    key = (K, device.type, device.index)
+    pair = _PAIR_INDEX_CACHE.get(key)
+    if pair is None:
+        pair = torch.triu_indices(K, K, offset=1, device=device)
+        _PAIR_INDEX_CACHE[key] = pair
+    return pair
+
+
+def freq_separation_loss(f, min_sep: float, valid=None, pair_bucket_size: int = 96):
     """Hinge penalty on too-close pairs of predicted frequencies.
 
     f: (B, K); valid: optional (B, K) bool, True at real slots — pairs touching
@@ -201,25 +271,51 @@ def freq_separation_loss(f, min_sep: float, valid=None):
     chunked evaluation (GradCache) recombines to exactly the full-batch value.
     Reduces to the plain all-pairs average when valid is None.
     """
-    diff = (f.unsqueeze(-1) - f.unsqueeze(-2)).abs()  # (B, K, K)
     K = f.size(-1)
-    eye = torch.eye(K, dtype=torch.bool, device=f.device)
-    penalty = torch.relu(min_sep - diff).masked_fill(eye, 0.0)
+    if K < 2:
+        return f.sum() * 0.0
     if valid is None:
-        return penalty.sum() / (f.size(0) * K * (K - 1))
-    pair_ok = valid.unsqueeze(-1) & valid.unsqueeze(-2)
-    penalty = penalty.masked_fill(~pair_ok, 0.0)
-    n_real = valid.sum(-1).to(f.dtype)
-    n_pairs = (n_real * (n_real - 1)).clamp(min=1.0)  # (B,)
-    return (penalty.sum(dim=(-1, -2)) / n_pairs).mean()
+        pair = _pair_indices(K, f.device)
+        i, j = pair[0], pair[1]
+        # Each unordered pair is sufficient: the original matrix counted both
+        # (i,j) and (j,i), and its denominator did too. This halves memory and
+        # arithmetic while preserving the same hinge (including its tie gradient).
+        penalty = torch.relu(min_sep - (f[:, i] - f[:, j]).abs())
+        return penalty.mean()
+
+    # Valid slots are a prefix for the right-padded batches used here. Grouping
+    # rows by a rounded-up real K prevents one long sentence from forcing a
+    # K_max² pair tensor for every short sentence; the per-row formula remains
+    # identical and each row still contributes equal weight.
+    n_real_long = valid.sum(-1)
+    limits = ((n_real_long + pair_bucket_size - 1) // pair_bucket_size * pair_bucket_size)
+    limits = limits.clamp(min=2, max=K)
+    loss_sum = f.new_zeros(())
+    for limit_t in torch.unique(limits, sorted=True):
+        limit = int(limit_t)
+        rows = limits == limit_t
+        fg = f[rows, :limit]
+        vg = valid[rows, :limit]
+        pair = _pair_indices(limit, f.device)
+        i, j = pair[0], pair[1]
+        penalty = torch.relu(min_sep - (fg[:, i] - fg[:, j]).abs())
+        penalty = penalty.masked_fill(~(vg[:, i] & vg[:, j]), 0.0)
+        n_real = n_real_long[rows].to(f.dtype)
+        n_pairs = (n_real * (n_real - 1) / 2).clamp(min=1.0)
+        loss_sum = loss_sum + (penalty.sum(dim=-1) / n_pairs).sum()
+    return loss_sum / f.size(0)
 
 
 class WaveformDecoder(nn.Module):
     def __init__(self, cfg):
         super().__init__()
         self.cfg = cfg
-        # Linear-project each sample's d_sine channels into d_model.
-        self.proj = nn.Linear(cfg.d_sine, cfg.d_model)
+        # The summed-symbol ablation exposes one scalar per sample to the
+        # decoder; multichannel checkpoints retain the legacy d_sine input.
+        self.input_channels = (
+            1 if getattr(cfg, "signal_channel_mode", "multi") == "sum" else cfg.d_sine
+        )
+        self.proj = nn.Linear(self.input_channels, cfg.d_model)
         # Learned positional embedding over the n_samples-long memory so the
         # decoder knows which sample is which. n_samples is fixed in cfg, so
         # this stays learned (only seq_len needed to become variable).
@@ -239,9 +335,14 @@ class WaveformDecoder(nn.Module):
         self.transformer = nn.TransformerDecoder(dec_layer, num_layers=cfg.decoder_layers)
 
     def forward(self, signal, L: int):
-        # signal: (B, N, d_sine); L = number of output token slots requested
+        # signal: (B, N, input_channels); L = output token slots requested
         cfg = self.cfg
         B = signal.size(0)
+        if signal.size(-1) != self.input_channels:
+            raise ValueError(
+                f"decoder expected {self.input_channels} signal channels, "
+                f"got {signal.size(-1)}"
+            )
         memory = self.mem_norm(self.proj(signal) + self.mem_pos_emb)
         # Sinusoidal positional queries — one per output slot. Variable in L.
         queries = sinusoidal_pe(L, cfg.d_model, signal.device, signal.dtype).expand(
@@ -267,13 +368,13 @@ class SpectralAE(nn.Module):
         L = tokens.size(1)
         A, f, phi = self.encoder(tokens)  # each (B, L, d_sine)
         signal = synthesize(A, f, phi, cfg.n_samples, cfg.duration)  # (B, N, d_sine)
+        signal = combine_signal_channels(signal, cfg)
         decoded_emb = self.decoder(signal, L)  # (B, L, d_model)
         # tied output projection
         logits = decoded_emb @ self.encoder.token_emb.weight.T  # (B, L, V)
-        # Frequency-separation aux: flatten (L, d_sine) so the penalty pushes
-        # ALL waves apart, both across tokens and across channels within a
-        # token. Without this, distinct channels could collapse to identical
-        # frequencies and waste capacity.
+        # Frequency-separation aux. Anchored mode separates only the token
+        # waves that actually sum into the same observable channel; legacy
+        # global mode retains the original all-wave separation behavior.
         min_sep = cfg.freq_sep_min_bins / cfg.duration
         fk, _ = freqs_for_separation(f, cfg)  # AE batches are unpadded
         aux = freq_separation_loss(fk, min_sep)

@@ -1,0 +1,38 @@
+{
+  "checkpoint": "all-training/freq-fix-d6-v3_summation_12d/2026-07-21_00-03-21/step_44000.pt",
+  "step": 44000,
+  "batch_size": 512,
+  "batches": 50,
+  "candidate_pairs": 25600,
+  "modes": {
+    "multi": {
+      "ce": 0.8398163139820098,
+      "accuracy": 0.8578125
+    },
+    "sum": {
+      "ce": 0.8408257246017456,
+      "accuracy": 0.8578125
+    }
+  },
+  "diagnostics": {
+    "cross_term_rms_ratio_all_pairs": 0.00783001442817819,
+    "cross_term_rms_ratio_positives": 0.0031640473885566492,
+    "self_cross_term_rms_ratio": 0.0029435450167189427,
+    "ideal_bandpass_recovery_cosine": 0.9932568605740865,
+    "ideal_bandpass_recovery_rel_l2": 0.1106657592455546,
+    "channel_energy_share": [
+      0.07245408775421776,
+      0.1067804363894829,
+      0.09762230530437334,
+      0.06206044976049779,
+      0.09697138539135329,
+      0.11562298314901384,
+      0.06850260868093941,
+      0.08528980543789527,
+      0.05881069599776106,
+      0.05518200358844094,
+      0.08525748542135986,
+      0.09544575312466454
+    ]
+  }
+}

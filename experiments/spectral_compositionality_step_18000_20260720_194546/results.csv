@@ -1,0 +1,11 @@
+idx,category,L_a,L_b,L_joined,l2_joint,l2_sum,l2_diff,rel_l2,cosine,a,b
+0,related,7,8,15,22.344841,43.746895,26.407648,1.181823,0.877590,The cat sat on the mat.,A feline rested on the rug.
+1,related,6,5,11,25.737427,47.513214,26.331146,1.023068,0.910397,She bought a new car.,He purchased a vehicle.
+2,related,6,7,13,21.782043,41.461132,24.397076,1.120054,0.884869,The team won the championship.,Our squad took home the trophy.
+3,unrelated,7,7,14,21.648407,33.856785,21.684763,1.001679,0.780895,Quantum physics is notoriously difficult.,I really enjoy strawberry ice cream.
+4,unrelated,6,9,15,19.867220,36.144257,24.646132,1.240543,0.761526,The election was hotly contested.,The chef prepared a five-course dinner.
+5,unrelated,7,7,14,21.525627,32.263554,21.623682,1.004555,0.746376,Birds migrate south in winter.,Stock prices fluctuated all morning.
+6,interacting,6,5,11,23.915329,35.499092,22.228500,0.929467,0.788025,The man approached the dog.,It started barking loudly.
+7,interacting,5,6,11,23.006981,39.678341,22.628420,0.983546,0.871773,The temperature dropped sharply.,Everyone reached for warm clothes.
+8,interacting,6,7,13,28.513374,50.407730,27.478811,0.963717,0.904083,She entered the dim room.,She closed the door behind her.
+9,interacting,7,6,13,21.558632,42.523029,27.221121,1.262655,0.835567,The window broke during the storm.,Rain poured onto the carpet.

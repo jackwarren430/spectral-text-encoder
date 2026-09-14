@@ -31,7 +31,7 @@ import torch
 from transformers import AutoTokenizer
 
 from infer_clip import load_clip_checkpoint, pick_device
-from model import synthesize
+from model import combine_signal_channels, synthesize
 
 
 DEFAULT_PAIRS = [
@@ -74,9 +74,10 @@ def tokenize_one(tokenizer, text, max_len, device):
 
 
 def wave_of(model, tokens, pad_mask, cfg):
-    """encoder → synthesize → (1, N, d_sine) waveform."""
+    """Encoder → synthesize → configured observable waveform."""
     A, f, phi = model.encoder(tokens, pad_mask=pad_mask)
-    return synthesize(A, f, phi, cfg.n_samples, cfg.duration)
+    signal = synthesize(A, f, phi, cfg.n_samples, cfg.duration)
+    return combine_signal_channels(signal, cfg)
 
 
 def compare_waveforms(w_joint, w_sum):
@@ -139,10 +140,13 @@ def plot_pair(w_joint, w_sum, cfg, out_path, title):
     plt.close(fig)
 
 
-def run(ckpt_path, pairs, device, out_root):
+def run(ckpt_path, pairs, device, out_root, channel_mode=None):
     device = pick_device(device)
     print(f"[compositionality] device={device}  ckpt={ckpt_path}")
     model, cfg, _, step = load_clip_checkpoint(ckpt_path, device)
+    if channel_mode is not None:
+        cfg.signal_channel_mode = channel_mode
+        print(f"[compositionality] overriding signal_channel_mode → {channel_mode}")
     if cfg.clip_encoder_mode != "spectral":
         raise RuntimeError(
             f"checkpoint mode={cfg.clip_encoder_mode!r}; this test only "
@@ -155,7 +159,8 @@ def run(ckpt_path, pairs, device, out_root):
     run_dir = os.path.join(out_root, f"spectral_compositionality_{ckpt_tag}_{ts}")
     os.makedirs(run_dir, exist_ok=True)
     print(f"[compositionality] step={step}  d_sine={cfg.d_sine}  "
-          f"n_samples={cfg.n_samples}  duration={cfg.duration}")
+          f"n_samples={cfg.n_samples}  duration={cfg.duration}  "
+          f"channels={cfg.signal_channel_mode}")
     print(f"[compositionality] writing → {run_dir}")
 
     results = []
@@ -251,6 +256,8 @@ def main():
     p.add_argument("--device", default="mps")
     p.add_argument("--out-root", default="./experiments",
                    help="parent dir for per-run output folder (default: ./experiments)")
+    p.add_argument("--channel-mode", choices=["multi", "sum"], default=None,
+                   help="override the checkpoint's observable channel readout")
     args = p.parse_args()
 
     if args.pairs_file:
@@ -262,7 +269,7 @@ def main():
     else:
         pairs = DEFAULT_PAIRS
 
-    run(args.ckpt, pairs, args.device, args.out_root)
+    run(args.ckpt, pairs, args.device, args.out_root, args.channel_mode)
 
 
 if __name__ == "__main__":

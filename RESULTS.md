@@ -222,3 +222,46 @@ conda run -n dl python infer_clip.py all-training/runpod-breakthrough/good-run/s
 
 Raw eval logs from the 2026-07-10 sweep are reproduced by the commands above; training
 metrics for every run are in each run directory's `metrics.csv` / `loss.png` / `acc.png`.
+
+## Anchored and summed-channel comparison (2026-07-21)
+
+The anchor and channel-summation experiments were reevaluated under a common retrieval
+protocol: the original three validation sources (all-NLI, Quora duplicates, and AltLex)
+with batches of 512. STS values are the mean across STS12–16, STS-B test, and SICK-R;
+Spearman/Pearson values are reported ×100.
+
+| checkpoint | old 3-data retrieval, B512 | STS Spearman | STS Pearson |
+|---|---:|---:|---:|
+| Standard anchored v3, `d_sine=6`, step 18k | 80.47% | 48.21 | 49.37 |
+| Summed `d_sine=6`, step 10k | 79.41% | 50.11 | 52.14 |
+| Summed `d_sine=12`, step 44k | **85.78%** | 56.98 | 59.50 |
+| Summed `d_sine=12` + more data, step 22k | 84.46% | **58.28** | **60.60** |
+
+Key conclusions:
+
+- **Increasing `d_sine` from 6 to 12 produced the clearest improvement.** The mature
+  summed-d12 model gained 5.31 retrieval points and 8.77 mean Spearman points over
+  standard anchored v3.
+- **The more-data run's roughly 66% native validation accuracy is not comparable to the
+  earlier 80–86% figures.** Its native validation uses all six data sources and batches
+  of 1,024, creating a larger, more varied candidate pool with more hard and false
+  negatives. Under the controlled old-three-source/B512 protocol it reaches 84.46%, only
+  1.32 points below the old-data d12 model.
+- **The additional data improves semantic generalization despite the lower native
+  retrieval number.** It has the best aggregate STS result measured here: 58.28
+  Spearman and 60.60 Pearson, gains of 1.30 and 1.10 over the old-data d12 model.
+- **Training directly with summed channels remains viable.** The d6 summed model was
+  stopped at 10k while still improving; even there, it traded about 1.06 retrieval
+  points for gains of 1.90 Spearman and 2.77 Pearson over standard v3. The d12 results
+  show that the scalar summed waveform can exceed the multichannel v3 baseline rather
+  than merely preserve it.
+- For selecting a general-purpose semantic checkpoint, STS and a fixed controlled
+  retrieval evaluation are more informative than comparing native validation accuracy
+  across runs with different datasets or batch sizes.
+
+Raw evaluation artifacts:
+
+- [`experiments/channel_sum_v3_step18000.json`](experiments/channel_sum_v3_step18000.json)
+- [`experiments/channel_sum_d6sum_step10000.json`](experiments/channel_sum_d6sum_step10000.json)
+- [`experiments/channel_sum_d12sum_step44000.json`](experiments/channel_sum_d12sum_step44000.json)
+- [`experiments/channel_sum_d12sum_1024_moredata_step22000.json`](experiments/channel_sum_d12sum_1024_moredata_step22000.json)

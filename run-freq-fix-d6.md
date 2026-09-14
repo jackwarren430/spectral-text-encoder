@@ -67,18 +67,20 @@ noise); 3-step end-to-end smoke on MPS.
 | `clip_embedding_type` | time | proven; spectral (\|rfft\|) is a follow-up ablation |
 | data | all-nli + quora + altlex (547k pairs) | same as good-run, keeps comparison clean |
 | batch | 512, `clip_cache_chunk_size=512` → direct mode | matches good-run; GradCache is a memory workaround the Spark doesn't need. Set chunk back to 32 on small-memory boxes. |
+| runtime | BF16 + TF32, fused AdamW, 8 workers | GB10 tensor-core path; frequency head and waveform synthesis stay FP32 |
+| execution buckets | 16 tokens | removes padding compute inside each sampled batch without changing its 512 negatives |
 
 ## Launching on the DGX Spark
 
 ```bash
-python train_clip.py --device cuda
+.venv/bin/python train_clip.py --device cuda
 ```
 
-- **Pass `--device cuda` and check the printed `device=` line.** The config
-  default is `mps`; on a non-Mac box that silently falls back to *CPU*.
-- **Env**: the Spark is aarch64 — use NVIDIA's ARM CUDA PyTorch build (NGC
-  PyTorch container or the aarch64 wheels). Also needs `transformers`,
-  `datasets`, `tqdm`, `matplotlib`.
+- **Pass `--device cuda` and check the startup banner.** It must show the GB10,
+  `precision=bf16`, `tf32=True`, pinned input memory, and fused AdamW. Explicit
+  CUDA requests now fail instead of silently falling back to CPU.
+- **Env**: follow `DGX_SPARK.md`; the Spark is ARM64 and needs a CUDA 13 PyTorch
+  build with native SM 12.1 support.
 - **First-run cache build**: `.cache/*.pt` is gitignored, so the first launch
   downloads the three datasets from HF and tokenizes (~547k pairs; needs
   network; this is the phase where the old PACE-ICE recon jobs died). To skip
@@ -92,15 +94,14 @@ python train_clip.py --device cuda
 |---|---|---|---|
 | M5 Mac, MPS | 15 | ~9 days | measured (smoke) |
 | good-run RunPod GPU, fp32 direct | 0.51 | ~7 h | measured (metrics.csv median, steps ≥ 20k) |
-| Spark, this code (fp32 eager) | ~1–2 | ~14–28 h | estimate: GB10 fp32 ≈ 31 TFLOPS is its weak mode |
-| Spark + bf16 autocast (not yet implemented) | ~0.4–0.7 | ~6–10 h | estimate; ±2× — GB10 unbenchmarked by us |
+| Spark, BF16 + execution buckets | 0.45–0.51 | ~6–7 h compute | measured synthetic batch at B=512, L_max=91, mean len=13.3; validation/checkpoints add time |
 
-Untapped software lever: padding waste. Mean all-nli length is 14 tokens but a
-512-batch pads to L_max ≈ 91 → **6.4× wasted compute** on any hardware.
-Length-bucketed batching would reclaim most of it but changes in-batch negative
-composition — skip it for this run, consider for the next. The Spark's 128 GB
-is also a *quality* lever: bf16 + GradCache would allow batch 2048–4096
-negatives, likely worth more Spearman than any speed gain.
+Mean all-nli length is 14 tokens while a 512-batch often reaches L_max ≈ 91.
+The runtime now buckets execution *inside the existing random batch*, then
+restores row order, reclaiming most padding work without changing in-batch
+negative composition. The Spark's 128 GB is also a future *quality* lever:
+GradCache would allow batch 2048–4096 negatives, but that is a separate
+experiment rather than a systems-only change to this controlled run.
 
 ## What to watch
 

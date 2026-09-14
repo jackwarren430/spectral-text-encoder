@@ -1,0 +1,313 @@
+{
+  "ckpt": "all-training/freq-fix-d6-v3_summation_12d_more_data/2026-07-21_16-48-49/step_28000.pt",
+  "step": 28000,
+  "cfg": {
+    "seq_len": 16,
+    "tokenizer_name": "gpt2",
+    "vocab_size": 50257,
+    "dataset_name": "wikitext",
+    "dataset_config": "wikitext-103-raw-v1",
+    "d_model": 512,
+    "n_layers": 8,
+    "n_heads": 8,
+    "ffn_dim": 2048,
+    "dropout": 0.1,
+    "decoder_layers": 8,
+    "d_sine": 12,
+    "sine_param_mode": "independent",
+    "n_samples": 2048,
+    "duration": 1.0,
+    "f_min": 1.0,
+    "f_max": 960.0,
+    "frequency_param_mode": "anchored",
+    "freq_anchor_radius_frac": 0.48,
+    "f_bias_spread": 3.0,
+    "A_max": 10.0,
+    "freq_sep_min_bins": 4.0,
+    "freq_sep_lambda": 0.05,
+    "batch_size": 128,
+    "lr": 0.0002,
+    "weight_decay": 0.05,
+    "warmup_steps": 2000,
+    "max_steps": 50000,
+    "grad_clip": 1.2,
+    "log_every": 50,
+    "val_every": 1000,
+    "val_batches": 50,
+    "ckpt_every": 1000,
+    "ckpt_dir": "all-training/e2e-train/",
+    "freeze_encoder": false,
+    "clip_dataset_name": "sentence-transformers/all-nli",
+    "clip_dataset_config": "pair",
+    "clip_max_len": 128,
+    "clip_val_frac": 0.05,
+    "clip_batch_size": 512,
+    "clip_grad_accum_steps": 1,
+    "clip_lr": 0.00015,
+    "clip_warmup_steps": 1500,
+    "clip_max_steps": 50000,
+    "clip_logit_scale_init": 2.6593,
+    "clip_logit_scale_max": 4.6052,
+    "clip_log_every": 100,
+    "clip_val_every": 500,
+    "clip_val_batches": 50,
+    "clip_stsb_eval": true,
+    "clip_stsb_batch_size": 128,
+    "clip_ckpt_every": 1000,
+    "clip_ckpt_dir": "all-training/freq-fix-d6-v3_summation_12d_more_data",
+    "clip_cache_chunk_size": 512,
+    "clip_length_bucket_size": 16,
+    "clip_dataset_specs": [
+      [
+        "sentence-transformers/all-nli",
+        "pair"
+      ],
+      [
+        "sentence-transformers/quora-duplicates",
+        "pair"
+      ],
+      [
+        "sentence-transformers/altlex",
+        ""
+      ],
+      [
+        "sentence-transformers/stackexchange-duplicates",
+        "title-title-pair"
+      ],
+      [
+        "sentence-transformers/coco-captions",
+        "pair"
+      ],
+      [
+        "sentence-transformers/sentence-compression",
+        "pair"
+      ]
+    ],
+    "clip_encoder_mode": "spectral",
+    "clip_embedding_type": "time",
+    "signal_channel_mode": "sum",
+    "clip_per_channel_lambda": 0.0,
+    "clip_recon_lambda": 0.0,
+    "device": "cuda",
+    "precision": "bf16",
+    "cuda_tf32": true,
+    "fused_optimizer": true,
+    "num_workers": 8,
+    "pin_memory": true,
+    "prefetch_factor": 4,
+    "persistent_workers": true,
+    "seed": 0
+  },
+  "pairs": [
+    {
+      "idx": 0,
+      "category": "related",
+      "a": "The cat sat on the mat.",
+      "b": "A feline rested on the rug.",
+      "joined": "The cat sat on the mat. A feline rested on the rug.",
+      "L_a": 7,
+      "L_b": 8,
+      "L_joined": 15,
+      "l2_joint": 31.25521469116211,
+      "l2_sum": 56.102264404296875,
+      "l2_diff": 31.219072341918945,
+      "rel_l2": 0.9988436377865169,
+      "cosine": 0.8981303572654724,
+      "per_channel_l2": [
+        31.219072341918945
+      ],
+      "plot": "pair_00_related.png"
+    },
+    {
+      "idx": 1,
+      "category": "related",
+      "a": "She bought a new car.",
+      "b": "He purchased a vehicle.",
+      "joined": "She bought a new car. He purchased a vehicle.",
+      "L_a": 6,
+      "L_b": 5,
+      "L_joined": 11,
+      "l2_joint": 31.069650650024414,
+      "l2_sum": 55.979759216308594,
+      "l2_diff": 30.944963455200195,
+      "rel_l2": 0.9959868491529331,
+      "cosine": 0.9030981063842773,
+      "per_channel_l2": [
+        30.944963455200195
+      ],
+      "plot": "pair_01_related.png"
+    },
+    {
+      "idx": 2,
+      "category": "related",
+      "a": "The team won the championship.",
+      "b": "Our squad took home the trophy.",
+      "joined": "The team won the championship. Our squad took home the trophy.",
+      "L_a": 6,
+      "L_b": 7,
+      "L_joined": 13,
+      "l2_joint": 25.858848571777344,
+      "l2_sum": 47.54793930053711,
+      "l2_diff": 26.082977294921875,
+      "rel_l2": 1.008667389908039,
+      "cosine": 0.9146404266357422,
+      "per_channel_l2": [
+        26.082977294921875
+      ],
+      "plot": "pair_02_related.png"
+    },
+    {
+      "idx": 3,
+      "category": "unrelated",
+      "a": "Quantum physics is notoriously difficult.",
+      "b": "I really enjoy strawberry ice cream.",
+      "joined": "Quantum physics is notoriously difficult. I really enjoy strawberry ice cream.",
+      "L_a": 7,
+      "L_b": 7,
+      "L_joined": 14,
+      "l2_joint": 29.39039421081543,
+      "l2_sum": 52.131038665771484,
+      "l2_diff": 29.43577766418457,
+      "rel_l2": 1.0015441593958763,
+      "cosine": 0.8860007524490356,
+      "per_channel_l2": [
+        29.43577766418457
+      ],
+      "plot": "pair_03_unrelated.png"
+    },
+    {
+      "idx": 4,
+      "category": "unrelated",
+      "a": "The election was hotly contested.",
+      "b": "The chef prepared a five-course dinner.",
+      "joined": "The election was hotly contested. The chef prepared a five-course dinner.",
+      "L_a": 6,
+      "L_b": 9,
+      "L_joined": 15,
+      "l2_joint": 28.935007095336914,
+      "l2_sum": 49.8080940246582,
+      "l2_diff": 26.250059127807617,
+      "rel_l2": 0.9072076271250683,
+      "cosine": 0.912093997001648,
+      "per_channel_l2": [
+        26.250059127807617
+      ],
+      "plot": "pair_04_unrelated.png"
+    },
+    {
+      "idx": 5,
+      "category": "unrelated",
+      "a": "Birds migrate south in winter.",
+      "b": "Stock prices fluctuated all morning.",
+      "joined": "Birds migrate south in winter. Stock prices fluctuated all morning.",
+      "L_a": 7,
+      "L_b": 7,
+      "L_joined": 14,
+      "l2_joint": 31.668838500976562,
+      "l2_sum": 51.361534118652344,
+      "l2_diff": 31.0175724029541,
+      "rel_l2": 0.9794351125949132,
+      "cosine": 0.8234657049179077,
+      "per_channel_l2": [
+        31.0175724029541
+      ],
+      "plot": "pair_05_unrelated.png"
+    },
+    {
+      "idx": 6,
+      "category": "interacting",
+      "a": "The man approached the dog.",
+      "b": "It started barking loudly.",
+      "joined": "The man approached the dog. It started barking loudly.",
+      "L_a": 6,
+      "L_b": 5,
+      "L_joined": 11,
+      "l2_joint": 31.042993545532227,
+      "l2_sum": 52.22324752807617,
+      "l2_diff": 28.10955810546875,
+      "rel_l2": 0.9055041055959739,
+      "cosine": 0.894661009311676,
+      "per_channel_l2": [
+        28.10955810546875
+      ],
+      "plot": "pair_06_interacting.png"
+    },
+    {
+      "idx": 7,
+      "category": "interacting",
+      "a": "The temperature dropped sharply.",
+      "b": "Everyone reached for warm clothes.",
+      "joined": "The temperature dropped sharply. Everyone reached for warm clothes.",
+      "L_a": 5,
+      "L_b": 6,
+      "L_joined": 11,
+      "l2_joint": 27.598323822021484,
+      "l2_sum": 53.7247314453125,
+      "l2_diff": 32.177398681640625,
+      "rel_l2": 1.1659185858224248,
+      "cosine": 0.881030261516571,
+      "per_channel_l2": [
+        32.177398681640625
+      ],
+      "plot": "pair_07_interacting.png"
+    },
+    {
+      "idx": 8,
+      "category": "interacting",
+      "a": "She entered the dim room.",
+      "b": "She closed the door behind her.",
+      "joined": "She entered the dim room. She closed the door behind her.",
+      "L_a": 6,
+      "L_b": 7,
+      "L_joined": 13,
+      "l2_joint": 29.931251525878906,
+      "l2_sum": 58.794837951660156,
+      "l2_diff": 33.49768829345703,
+      "rel_l2": 1.119154281420359,
+      "cosine": 0.9178916215896606,
+      "per_channel_l2": [
+        33.49768829345703
+      ],
+      "plot": "pair_08_interacting.png"
+    },
+    {
+      "idx": 9,
+      "category": "interacting",
+      "a": "The window broke during the storm.",
+      "b": "Rain poured onto the carpet.",
+      "joined": "The window broke during the storm. Rain poured onto the carpet.",
+      "L_a": 7,
+      "L_b": 6,
+      "L_joined": 13,
+      "l2_joint": 27.110645294189453,
+      "l2_sum": 51.014251708984375,
+      "l2_diff": 30.004676818847656,
+      "rel_l2": 1.1067488985693186,
+      "cosine": 0.8810949921607971,
+      "per_channel_l2": [
+        30.004676818847656
+      ],
+      "plot": "pair_09_interacting.png"
+    }
+  ],
+  "category_summary": [
+    {
+      "category": "related",
+      "n": 3,
+      "avg_rel_l2": 1.001165958949163,
+      "avg_cosine": 0.9052896300951639
+    },
+    {
+      "category": "unrelated",
+      "n": 3,
+      "avg_rel_l2": 0.9627289663719526,
+      "avg_cosine": 0.8738534847895304
+    },
+    {
+      "category": "interacting",
+      "n": 4,
+      "avg_rel_l2": 1.074331467852019,
+      "avg_cosine": 0.8936694711446762
+    }
+  ]
+}

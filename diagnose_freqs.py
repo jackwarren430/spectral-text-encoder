@@ -3,11 +3,9 @@
 Answers three questions about the encoder's predicted frequencies on real
 validation data:
 
-1. Is the f-head sigmoid saturated? Histogram of pre-sigmoid values
-   (raw_f + f_bias), recovered by inverting f = f_min + (f_max-f_min)·σ(x).
-   Mass beyond |x| ≈ 4 means the frequency is pinned at a band edge and no
-   loss (aux or task) can move it — the collapse is a parameterization
-   problem, not a loss-weighting problem.
+1. Is the frequency transform saturated? For legacy global mode, invert the
+   full-band sigmoid. For anchored mode, invert each channel's bounded
+   softsign offset and report occupancy near its local region boundary.
 2. Does f vary with the input at all? Per-slot std of raw_f (bias removed)
    across sentences. Near-zero means the model has abandoned frequency as an
    information channel and encodes only in A and phi.
@@ -22,12 +20,19 @@ import os
 
 import torch
 
-from config import Config
+from config import Config, config_from_snapshot
 from data_clip import make_clip_loaders
-from model import SpectralAE, f_init_bias, freq_separation_loss, freqs_for_separation
+from model import (
+    SpectralAE,
+    f_init_bias,
+    freq_separation_loss,
+    freqs_for_separation,
+    frequency_anchor_radius,
+    frequency_anchors,
+)
 
-EPS = 1e-7          # sigmoid inversion clamp; |logit| ≈ 16.1 at the clamp
-SAT_THRESHOLD = 4.0  # |pre-sigmoid| beyond this = within ~1.8% of a band edge
+EPS = 1e-7           # inverse-transform clamp
+SAT_THRESHOLD = 4.0  # local/global transform-input saturation threshold
 EDGE_HZ = 20.0       # "cluster at the edge" = within this many Hz of f_min/f_max
 
 
@@ -58,7 +63,7 @@ def load_checkpoint(ckpt_path: str, device: str):
     if stored is not None and stored != inferred:
         raise RuntimeError(f"stored sine_param_mode={stored!r} but head shape says {inferred!r}")
     cfg_dict["sine_param_mode"] = inferred
-    cfg = Config(**cfg_dict)
+    cfg = config_from_snapshot(cfg_dict)
     model = SpectralAE(cfg).to(device)
     model.load_state_dict(blob["model"])
     model.eval()
@@ -68,14 +73,16 @@ def load_checkpoint(ckpt_path: str, device: str):
 @torch.no_grad()
 def collect(model, cfg, loader, n_batches, device):
     """Run encoder on val batches (both pair sides). Returns dict of flat CPU
-    tensors: pre-sigmoid / f / raw_f at real slots, f at pad slots, pinned
+    tensors: pre-transform / f / raw_f at real slots, f at pad slots, pinned
     flags, per-unit raw_f groups for input-variation stats, and the aux loss
     computed the old (unmasked) and new (masked) way."""
     shared = cfg.sine_param_mode == "shared"
+    anchored = getattr(cfg, "frequency_param_mode", "global") == "anchored"
     min_sep = cfg.freq_sep_min_bins / cfg.duration
     span = cfg.f_max - cfg.f_min
 
     pre_real, f_real, f_pad, pinned_real = [], [], [], []
+    f_by_channel = [[] for _ in range(cfg.d_sine if not shared else 1)]
     raw_by_unit = {}  # (pos, ch) -> list of raw_f tensors across rows
     aux_old_sum, aux_new_sum, n_sides = 0.0, 0.0, 0
 
@@ -90,16 +97,22 @@ def collect(model, cfg, loader, n_batches, device):
             B, L, D = f.shape
             lengths = (~mask).sum(dim=-1)
             bias = f_init_bias(
-                L, 1 if shared else D, cfg.f_bias_spread, device, f.dtype,
+                L, 1 if (shared or anchored) else D, cfg.f_bias_spread, device, f.dtype,
                 real_lengths=lengths,
             )
             if shared:
                 f_unit = f[..., :1]  # (B, L, 1) — one frequency per slot
             else:
                 f_unit = f  # (B, L, D)
-            p = (f_unit - cfg.f_min) / span
-            pinned = (p < EPS) | (p > 1 - EPS)
-            pre = torch.logit(p, eps=EPS)
+            if anchored:
+                anchors = frequency_anchors(cfg, device, f.dtype).view(1, 1, D)
+                p = (f_unit - anchors) / frequency_anchor_radius(cfg)
+                pinned = p.abs() > 1 - EPS
+                pre = p / (1.0 - p.abs()).clamp(min=EPS)  # inverse softsign
+            else:
+                p = (f_unit - cfg.f_min) / span
+                pinned = (p < EPS) | (p > 1 - EPS)
+                pre = torch.logit(p, eps=EPS)
             raw = pre - bias
 
             real = (~mask).unsqueeze(-1).expand_as(f_unit)
@@ -107,6 +120,8 @@ def collect(model, cfg, loader, n_batches, device):
             f_real.append(f_unit[real].cpu())
             f_pad.append(f_unit[~real].cpu())
             pinned_real.append(pinned[real].cpu())
+            for ch in range(f_unit.size(-1)):
+                f_by_channel[ch].append(f_unit[:, :, ch][~mask].cpu())
 
             for pos in range(L):
                 rows = ~mask[:, pos]
@@ -127,6 +142,7 @@ def collect(model, cfg, loader, n_batches, device):
         "f": torch.cat(f_real),
         "f_pad": torch.cat(f_pad),
         "pinned": torch.cat(pinned_real),
+        "f_by_channel": [torch.cat(parts) for parts in f_by_channel],
         "raw_by_unit": {k: torch.cat(v) for k, v in raw_by_unit.items()},
         "aux_old": aux_old_sum / max(1, n_sides),
         "aux_new": aux_new_sum / max(1, n_sides),
@@ -138,10 +154,15 @@ def report(d, cfg):
     n = pre.numel()
     frac = lambda m: 100.0 * m.sum().item() / n
 
-    print(f"\n=== saturation (n={n} real waves, {f_pad.numel()} pad waves) ===")
-    print(f"  |pre-sigmoid| > {SAT_THRESHOLD:.0f}   : {frac(pre.abs() > SAT_THRESHOLD):5.1f}%   (within ~1.8% of a band edge)")
-    print(f"  |pre-sigmoid| > 6   : {frac(pre.abs() > 6):5.1f}%   (within ~0.25%)")
-    print(f"  numerically pinned  : {frac(pinned):5.1f}%   (f indistinguishable from f_min/f_max in float32)")
+    anchored = getattr(cfg, "frequency_param_mode", "global") == "anchored"
+    transform = "local softsign" if anchored else "global sigmoid"
+    print(f"\n=== {transform} saturation (n={n} real waves, {f_pad.numel()} pad waves) ===")
+    print(f"  |transform input| > {SAT_THRESHOLD:.0f}: {frac(pre.abs() > SAT_THRESHOLD):5.1f}%")
+    print(f"  |transform input| > 6: {frac(pre.abs() > 6):5.1f}%")
+    print(f"  numerically pinned  : {frac(pinned):5.1f}%")
+    if anchored:
+        ratio = pre.abs() / (1.0 + pre.abs())
+        print(f"  > 90% local radius : {frac(ratio > 0.9):5.1f}%")
 
     lo, hi = cfg.f_min + EDGE_HZ, cfg.f_max - EDGE_HZ
     print(f"\n=== frequency distribution (Hz) ===")
@@ -150,6 +171,15 @@ def report(d, cfg):
     print(f"  low edge  [{cfg.f_min:.0f}, {lo:.0f}]  : {frac(f < lo):5.1f}%")
     print(f"  middle    ({lo:.0f}, {hi:.0f}) : {frac((f >= lo) & (f <= hi)):5.1f}%")
     print(f"  high edge [{hi:.0f}, {cfg.f_max:.0f}]: {frac(f > hi):5.1f}%")
+    if anchored:
+        print("\n=== per-channel anchored regions (observed min / max Hz) ===")
+        anchors = frequency_anchors(cfg, torch.device("cpu"), torch.float32)
+        radius = frequency_anchor_radius(cfg)
+        for ch, vals in enumerate(d["f_by_channel"]):
+            print(
+                f"  ch {ch}: allowed [{anchors[ch]-radius:7.2f}, {anchors[ch]+radius:7.2f}]"
+                f"  observed [{vals.min():7.2f}, {vals.max():7.2f}]"
+            )
 
     stds, means = [], []
     for vals in d["raw_by_unit"].values():
@@ -162,8 +192,8 @@ def report(d, cfg):
     print(f"  std of per-unit means           : {means_t.std():.4f}   (positional variation, for scale)")
 
     print(f"\n=== separation aux on these batches (min_sep={cfg.freq_sep_min_bins / cfg.duration:.1f} Hz) ===")
-    print(f"  old, pads included : {d['aux_old']:.4f}")
-    print(f"  fixed, pads masked : {d['aux_new']:.4f}")
+    print(f"  pads included      : {d['aux_old']:.4f}")
+    print(f"  pads masked        : {d['aux_new']:.4f}")
 
 
 def plot(d, cfg, step, out_path):
@@ -180,8 +210,9 @@ def plot(d, cfg, step, out_path):
     for x in (-SAT_THRESHOLD, SAT_THRESHOLD):
         ax1.axvline(x, color="tab:red", linestyle="--", linewidth=1)
     sat = 100.0 * (abs(pre) > SAT_THRESHOLD).mean()
-    ax1.set_title(f"pre-sigmoid (raw_f + f_bias), real slots — {sat:.0f}% saturated")
-    ax1.set_xlabel("pre-sigmoid value")
+    transform = "softsign" if getattr(cfg, "frequency_param_mode", "global") == "anchored" else "sigmoid"
+    ax1.set_title(f"pre-{transform} (raw_f + f_bias), real slots — {sat:.0f}% saturated")
+    ax1.set_xlabel(f"pre-{transform} value")
     ax1.set_ylabel("count")
     ax1.grid(True, alpha=0.3)
 
@@ -197,7 +228,10 @@ def plot(d, cfg, step, out_path):
     ax2.legend(loc="upper center", fontsize=8)
     ax2.grid(True, alpha=0.3)
 
-    fig.suptitle(f"frequency diagnostic — step {step}, {cfg.sine_param_mode} mode, d_sine={cfg.d_sine}")
+    fig.suptitle(
+        f"frequency diagnostic — step {step}, {cfg.sine_param_mode}/"
+        f"{getattr(cfg, 'frequency_param_mode', 'global')}, d_sine={cfg.d_sine}"
+    )
     fig.tight_layout()
     fig.savefig(out_path, dpi=120)
     plt.close(fig)
@@ -215,7 +249,8 @@ def main():
     device = pick_device(args.device)
     print(f"[diagnose_freqs] device={device}  ckpt={args.ckpt}")
     model, cfg, step = load_checkpoint(args.ckpt, device)
-    print(f"[diagnose_freqs] step={step}  mode={cfg.sine_param_mode}  d_sine={cfg.d_sine}  "
+    print(f"[diagnose_freqs] step={step}  mode={cfg.sine_param_mode}/"
+          f"{getattr(cfg, 'frequency_param_mode', 'global')}  d_sine={cfg.d_sine}  "
           f"f∈[{cfg.f_min}, {cfg.f_max}]  bias spread=±{cfg.f_bias_spread}")
 
     _, val_loader = make_clip_loaders(cfg)

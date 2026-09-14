@@ -2,6 +2,7 @@ import argparse
 import math
 import os
 import time
+from contextlib import nullcontext
 
 import torch
 import torch.nn as nn
@@ -10,7 +11,15 @@ from torch.optim import AdamW
 from tqdm import tqdm
 
 from config import Config
-from model import SpectralAE, freq_separation_loss, freqs_for_separation, synthesize
+from model import (
+    SpectralAE,
+    combine_signal_channels,
+    freq_separation_loss,
+    freqs_for_separation,
+    frequency_anchor_radius,
+    frequency_anchors,
+    synthesize,
+)
 from run_utils import (
     MetricsLogger,
     find_latest_ckpt,
@@ -32,52 +41,139 @@ def lr_lambda(step, cfg: Config):
 
 
 def pick_device(requested: str) -> str:
-    if requested == "mps" and not torch.backends.mps.is_available():
+    if requested == "auto":
+        if torch.cuda.is_available():
+            return "cuda"
+        if torch.backends.mps.is_available():
+            return "mps"
         return "cpu"
-    if requested == "cuda" and not torch.cuda.is_available():
-        return "cpu"
+    if requested.startswith("mps") and not torch.backends.mps.is_available():
+        raise RuntimeError("MPS was requested but is unavailable")
+    if requested.startswith("cuda") and not torch.cuda.is_available():
+        raise RuntimeError("CUDA was requested but is unavailable")
     return requested
+
+
+def _device_type(device: str) -> str:
+    return str(device).split(":", 1)[0]
+
+
+def _use_bf16(cfg: Config, device: str) -> bool:
+    return getattr(cfg, "precision", "fp32") == "bf16" and _device_type(device) == "cuda"
+
+
+def _autocast(cfg: Config, device: str):
+    if not _use_bf16(cfg, device):
+        return nullcontext()
+    return torch.autocast(device_type="cuda", dtype=torch.bfloat16)
+
+
+def _move_batch(batch, device: str, cfg: Config):
+    non_blocking = bool(
+        _device_type(device) == "cuda" and getattr(cfg, "pin_memory", False)
+    )
+    return tuple(x.to(device, non_blocking=non_blocking) for x in batch)
+
+
+def configure_runtime(cfg: Config, device: str) -> str:
+    """Configure the CUDA math path and return the effective precision."""
+    if _device_type(device) != "cuda":
+        return "fp32"
+    if _use_bf16(cfg, device) and not torch.cuda.is_bf16_supported():
+        raise RuntimeError("precision='bf16' was requested but this CUDA GPU lacks BF16 support")
+    use_tf32 = bool(getattr(cfg, "cuda_tf32", False))
+    torch.backends.cuda.matmul.allow_tf32 = use_tf32
+    torch.backends.cudnn.allow_tf32 = use_tf32
+    torch.set_float32_matmul_precision("high" if use_tf32 else "highest")
+    return "bf16" if _use_bf16(cfg, device) else "fp32"
 
 
 def _snapshot_rng(device):
     state = {"cpu": torch.get_rng_state()}
-    if device == "cuda" and torch.cuda.is_available():
+    if _device_type(device) == "cuda" and torch.cuda.is_available():
         state["cuda"] = torch.cuda.get_rng_state()
-    elif device == "mps" and torch.backends.mps.is_available():
+    elif _device_type(device) == "mps" and torch.backends.mps.is_available():
         state["mps"] = torch.mps.get_rng_state()
     return state
 
 
 def _restore_rng(state, device):
     torch.set_rng_state(state["cpu"])
-    if device == "cuda" and "cuda" in state:
+    if _device_type(device) == "cuda" and "cuda" in state:
         torch.cuda.set_rng_state(state["cuda"])
-    elif device == "mps" and "mps" in state:
+    elif _device_type(device) == "mps" and "mps" in state:
         torch.mps.set_rng_state(state["mps"])
+
+
+def _encode_to_signal_unbucketed(model, tokens, pad_mask, cfg: Config):
+    A, f, phi = model.encoder(tokens, pad_mask=pad_mask)
+    signal = synthesize(A, f, phi, cfg.n_samples, cfg.duration)
+    return signal, f
 
 
 def encode_to_signal(model, tokens, pad_mask, cfg: Config):
     """encoder → synthesize. Returns (signal, f) with signal shape
     (B, N, d_sine) and f shape (B, L, d_sine). The signal is the architectural
     bottleneck; everything downstream (main embedding, per-channel embedding,
-    reconstruction) is computed from it."""
-    A, f, phi = model.encoder(tokens, pad_mask=pad_mask)
-    signal = synthesize(A, f, phi, cfg.n_samples, cfg.duration)
+    reconstruction) is computed from it.
+
+    On large direct batches, rows are grouped by rounded-up real length and
+    encoded at that shorter width. Batch membership and final row order are
+    unchanged, so the full-batch contrastive loss sees exactly the same
+    negatives while transformer and synthesis padding work is greatly reduced.
+    """
+    bucket = int(getattr(cfg, "clip_length_bucket_size", 0) or 0)
+    if bucket <= 0 or pad_mask is None or tokens.size(0) < 2:
+        return _encode_to_signal_unbucketed(model, tokens, pad_mask, cfg)
+
+    B, L = tokens.shape
+    lengths = (~pad_mask).sum(dim=-1)
+    bucket_lengths = ((lengths + bucket - 1) // bucket * bucket).clamp(max=L)
+    limits = torch.unique(bucket_lengths, sorted=True)
+    if limits.numel() == 1 and int(limits[0]) == L:
+        return _encode_to_signal_unbucketed(model, tokens, pad_mask, cfg)
+
+    signals, freqs, row_ids = [], [], []
+    for limit_t in limits:
+        limit = int(limit_t)
+        idx = (bucket_lengths == limit_t).nonzero(as_tuple=False).flatten()
+        group_signal, group_f = _encode_to_signal_unbucketed(
+            model,
+            tokens.index_select(0, idx)[:, :limit],
+            pad_mask.index_select(0, idx)[:, :limit],
+            cfg,
+        )
+        signals.append(group_signal)
+        # Frequency health/loss callers expect the original batch L. Values in
+        # the padded tail are irrelevant because the matching valid mask is false.
+        freqs.append(F.pad(group_f, (0, 0, 0, L - limit)))
+        row_ids.append(idx)
+
+    row_ids = torch.cat(row_ids)
+    restore = torch.argsort(row_ids)
+    signal = torch.cat(signals, dim=0).index_select(0, restore)
+    f = torch.cat(freqs, dim=0).index_select(0, restore)
+    assert signal.size(0) == B
     return signal, f
 
 
 def signal_to_embedding(signal, cfg: Config, channel: int | None = None):
     """Flatten + L2-normalize a (slice of a) signal into an embedding.
 
-    channel=None uses all d_sine channels (the "full" embedding); an integer
-    selects one channel for the per-channel InfoNCE.
+    channel=None applies cfg.signal_channel_mode to construct the observable
+    symbol; an integer always selects one pre-combination channel for the
+    optional per-channel InfoNCE.
 
     cfg.clip_embedding_type picks the representation:
       - "time":     flatten the waveform directly (default).
       - "spectral": take |rfft(signal)| along the time axis per channel before
                     flatten. Phase-invariant; dimensionality (N//2+1) per channel.
     """
-    x = signal if channel is None else signal[:, :, channel:channel + 1]
+    x = (
+        combine_signal_channels(signal, cfg)
+        if channel is None
+        else signal[:, :, channel:channel + 1]
+    )
     etype = getattr(cfg, "clip_embedding_type", "time")
     if etype == "spectral":
         spec = torch.fft.rfft(x, dim=1).abs()
@@ -139,6 +235,7 @@ def reconstruction_ce_sum(model, signal, tokens, pad_mask):
     token count rather than per-chunk counts (which would diverge under
     variable-length sentences)."""
     L = tokens.size(1)
+    signal = combine_signal_channels(signal, model.cfg)
     decoded = model.decoder(signal, L)                         # (B, L, d_model)
     logits = decoded @ model.encoder.token_emb.weight.T        # (B, L, V)
     targets = tokens.clone()
@@ -157,13 +254,22 @@ def reconstruction_ce_sum(model, signal, tokens, pad_mask):
 def _per_channel_loss(sig_a, sig_b, logit_scale, cfg: Config):
     """Average symmetric InfoNCE across channels (each channel treated as its
     own embedding via signal_to_embedding(..., channel=c))."""
-    total = sig_a.new_zeros(())
-    for c in range(cfg.d_sine):
-        ea = signal_to_embedding(sig_a, cfg, channel=c)
-        eb = signal_to_embedding(sig_b, cfg, channel=c)
-        l, _ = contrastive_loss(ea, eb, logit_scale)
-        total = total + l
-    return total / cfg.d_sine
+    if cfg.clip_embedding_type == "spectral":
+        xa = torch.fft.rfft(sig_a, dim=1).abs()
+        xb = torch.fft.rfft(sig_b, dim=1).abs()
+    elif cfg.clip_embedding_type == "time":
+        xa, xb = sig_a, sig_b
+    else:
+        raise ValueError(f"Unknown clip_embedding_type: {cfg.clip_embedding_type!r}")
+    # (B, N, D) -> (D, B, N), then one strided batched GEMM for every channel.
+    ea = F.normalize(xa.transpose(1, 2), dim=-1).transpose(0, 1)
+    eb = F.normalize(xb.transpose(1, 2), dim=-1).transpose(0, 1)
+    logits = torch.bmm(ea, eb.transpose(1, 2)) * logit_scale.exp()
+    D, B, _ = logits.shape
+    targets = torch.arange(B, device=logits.device).repeat(D)
+    ab = F.cross_entropy(logits.reshape(D * B, B), targets)
+    ba = F.cross_entropy(logits.transpose(1, 2).reshape(D * B, B), targets)
+    return 0.5 * (ab + ba)
 
 
 def contrastive_loss(emb_a, emb_b, logit_scale):
@@ -185,10 +291,11 @@ def validate_pooled(model, loader, logit_scale, device, cfg: Config, max_batches
     for i, batch in enumerate(loader):
         if i >= max_batches:
             break
-        ta, ma, tp, mp = [x.to(device) for x in batch]
-        emb_a = encode_to_pooled_embedding(model, ta, ma, cfg)
-        emb_b = encode_to_pooled_embedding(model, tp, mp, cfg)
-        loss_ce, logits = contrastive_loss(emb_a, emb_b, logit_scale)
+        ta, ma, tp, mp = _move_batch(batch, device, cfg)
+        with _autocast(cfg, device):
+            emb_a = encode_to_pooled_embedding(model, ta, ma, cfg)
+            emb_b = encode_to_pooled_embedding(model, tp, mp, cfg)
+            loss_ce, logits = contrastive_loss(emb_a, emb_b, logit_scale)
         bs = emb_a.size(0)
         total_ce += loss_ce.item() * bs
         targets = torch.arange(bs, device=device)
@@ -204,23 +311,75 @@ def validate_pooled(model, loader, logit_scale, device, cfg: Config, max_batches
         "acc": total_correct / n,
         "sat": 0.0,
         "mid": 0.0,
+        "offset_sat": 0.0,
+        "boundary": 0.0,
+        "spacing": 0.0,
+        "band_use": 0.0,
     }
 
 
 def _freq_health(fk, valid, cfg: Config):
-    """Frequency-collapse counters over one batch side.
+    """Frequency-health counters over one batch side.
 
     fk: (B, K) frequencies from freqs_for_separation; valid: matching real-slot
-    mask (None = all real). Returns (n_saturated, n_mid_band, n_waves) where
-    "saturated" means |pre-sigmoid| > 4 (within ~1.8% of a band edge, so the
-    f gradient is attenuated ~50×+) and "mid band" means more than 20 Hz from
-    both edges. Healthy separation = sat falling, mid rising."""
+    mask (None = all real). Global mode retains its legacy sigmoid saturation
+    and mid-band counters. Anchored mode instead measures local softsign
+    saturation, occupancy near each allowed offset boundary, mean
+    nearest-neighbor spacing within channel, and observed full-band span."""
     vals = fk[valid] if valid is not None else fk.reshape(-1)
+    result = {
+        "n_waves": vals.numel(),
+        "n_sat": 0,
+        "n_mid": 0,
+        "n_offset_sat": 0,
+        "n_boundary": 0,
+        "spacing_sum": 0.0,
+        "spacing_count": 0,
+        "min_f": vals.min().item() if vals.numel() else float("inf"),
+        "max_f": vals.max().item() if vals.numel() else float("-inf"),
+    }
+    if getattr(cfg, "frequency_param_mode", "global") == "anchored":
+        D = cfg.d_sine
+        if fk.size(0) % D != 0:
+            raise ValueError(
+                f"anchored separation rows={fk.size(0)} not divisible by d_sine={D}"
+            )
+        B = fk.size(0) // D
+        anchors = frequency_anchors(cfg, fk.device, fk.dtype).repeat(B).unsqueeze(-1)
+        ratio = (fk - anchors) / frequency_anchor_radius(cfg)
+        real_ratio = ratio[valid] if valid is not None else ratio.reshape(-1)
+        # softsign^-1(y) = y / (1-|y|). |raw|>4 means the local derivative
+        # has fallen below 4% of its value at the anchor (|offset|>0.8 radius).
+        raw = real_ratio / (1.0 - real_ratio.abs()).clamp(min=1e-7)
+        result["n_offset_sat"] = (raw.abs() > 4.0).sum().item()
+        result["n_boundary"] = (real_ratio.abs() > 0.9).sum().item()
+
+        K = fk.size(1)
+        if K >= 2:
+            vg = torch.ones_like(fk, dtype=torch.bool) if valid is None else valid
+            n_real = vg.sum(dim=-1)
+            ordered = fk.masked_fill(~vg, float("inf")).sort(dim=-1).values
+            gaps = ordered[:, 1:] - ordered[:, :-1]
+            pair_valid = torch.arange(K - 1, device=fk.device).unsqueeze(0) < (
+                n_real - 1
+            ).clamp(min=0).unsqueeze(1)
+            gaps = gaps.masked_fill(~pair_valid, float("inf"))
+            inf = torch.full((fk.size(0), 1), float("inf"), device=fk.device, dtype=fk.dtype)
+            nearest = torch.minimum(torch.cat([inf, gaps], dim=1),
+                                    torch.cat([gaps, inf], dim=1))
+            point_valid = torch.arange(K, device=fk.device).unsqueeze(0) < n_real.unsqueeze(1)
+            point_valid &= (n_real >= 2).unsqueeze(1)
+            result["spacing_sum"] = nearest.masked_fill(~point_valid, 0.0).sum().item()
+            result["spacing_count"] = point_valid.sum().item()
+        return result
+
     p = (vals - cfg.f_min) / (cfg.f_max - cfg.f_min)
     pre = torch.logit(p, eps=1e-7)
-    n_sat = (pre.abs() > 4.0).sum().item()
-    n_mid = ((vals > cfg.f_min + 20.0) & (vals < cfg.f_max - 20.0)).sum().item()
-    return n_sat, n_mid, vals.numel()
+    result["n_sat"] = (pre.abs() > 4.0).sum().item()
+    result["n_mid"] = (
+        (vals > cfg.f_min + 20.0) & (vals < cfg.f_max - 20.0)
+    ).sum().item()
+    return result
 
 
 @torch.no_grad()
@@ -235,37 +394,52 @@ def validate(model, loader, logit_scale, device, cfg: Config, max_batches: int, 
     total_recon = 0.0
     total_correct = 0
     total = 0
-    total_sat = total_mid = total_waves = 0
+    total_sat = total_mid = total_offset_sat = total_boundary = total_waves = 0
+    spacing_sum = 0.0
+    spacing_count = 0
+    min_f = float("inf")
+    max_f = float("-inf")
     for i, batch in enumerate(loader):
         if i >= max_batches:
             break
-        ta, ma, tp, mp = [x.to(device) for x in batch]
-        sig_a, fa = encode_to_signal(model, ta, ma, cfg)
-        sig_b, fb = encode_to_signal(model, tp, mp, cfg)
-        emb_a = signal_to_embedding(sig_a, cfg)
-        emb_b = signal_to_embedding(sig_b, cfg)
-        loss_ce, logits = contrastive_loss(emb_a, emb_b, logit_scale)
-        fka, va = freqs_for_separation(fa, cfg, ma)
-        fkb, vb = freqs_for_separation(fb, cfg, mp)
-        aux = 0.5 * (
-            freq_separation_loss(fka, min_sep, va)
-            + freq_separation_loss(fkb, min_sep, vb)
-        )
+        ta, ma, tp, mp = _move_batch(batch, device, cfg)
+        with _autocast(cfg, device):
+            sig_a, fa = encode_to_signal(model, ta, ma, cfg)
+            sig_b, fb = encode_to_signal(model, tp, mp, cfg)
+            emb_a = signal_to_embedding(sig_a, cfg)
+            emb_b = signal_to_embedding(sig_b, cfg)
+            loss_ce, logits = contrastive_loss(emb_a, emb_b, logit_scale)
+            fka, va = freqs_for_separation(fa, cfg, ma)
+            fkb, vb = freqs_for_separation(fb, cfg, mp)
+            aux = 0.5 * (
+                freq_separation_loss(fka, min_sep, va)
+                + freq_separation_loss(fkb, min_sep, vb)
+            )
+            pc = None
+            if cfg.clip_per_channel_lambda > 0:
+                pc = _per_channel_loss(sig_a, sig_b, logit_scale, cfg)
+            recon = None
+            if cfg.clip_recon_lambda > 0:
+                sa, na = reconstruction_ce_sum(model, sig_a, ta, ma)
+                sb, nb = reconstruction_ce_sum(model, sig_b, tp, mp)
+                recon = 0.5 * (sa / na + sb / nb)
         for fk, valid in [(fka, va), (fkb, vb)]:
-            n_sat, n_mid, n_waves = _freq_health(fk, valid, cfg)
-            total_sat += n_sat
-            total_mid += n_mid
-            total_waves += n_waves
+            health = _freq_health(fk, valid, cfg)
+            total_sat += health["n_sat"]
+            total_mid += health["n_mid"]
+            total_offset_sat += health["n_offset_sat"]
+            total_boundary += health["n_boundary"]
+            total_waves += health["n_waves"]
+            spacing_sum += health["spacing_sum"]
+            spacing_count += health["spacing_count"]
+            min_f = min(min_f, health["min_f"])
+            max_f = max(max_f, health["max_f"])
         bs = emb_a.size(0)
         total_ce += loss_ce.item() * bs
         total_aux += aux.item() * bs
-        if cfg.clip_per_channel_lambda > 0:
-            pc = _per_channel_loss(sig_a, sig_b, logit_scale, cfg)
+        if pc is not None:
             total_pc += pc.item() * bs
-        if cfg.clip_recon_lambda > 0:
-            sa, na = reconstruction_ce_sum(model, sig_a, ta, ma)
-            sb, nb = reconstruction_ce_sum(model, sig_b, tp, mp)
-            recon = 0.5 * (sa / na + sb / nb)
+        if recon is not None:
             total_recon += recon.item() * bs
         targets = torch.arange(bs, device=device)
         total_correct += (logits.argmax(-1) == targets).sum().item()
@@ -273,6 +447,7 @@ def validate(model, loader, logit_scale, device, cfg: Config, max_batches: int, 
     model.train()
     n = max(1, total)
     nw = max(1, total_waves)
+    observed_span = max(0.0, max_f - min_f) if total_waves else 0.0
     return {
         "ce": total_ce / n,
         "aux": total_aux / n,
@@ -281,6 +456,10 @@ def validate(model, loader, logit_scale, device, cfg: Config, max_batches: int, 
         "acc": total_correct / n,
         "sat": total_sat / nw,
         "mid": total_mid / nw,
+        "offset_sat": total_offset_sat / nw,
+        "boundary": total_boundary / nw,
+        "spacing": spacing_sum / max(1, spacing_count),
+        "band_use": observed_span / (cfg.f_max - cfg.f_min),
     }
 
 
@@ -289,33 +468,34 @@ def micro_step_direct(model, batch, logit_scale, cfg, accum, min_sep, device):
 
     Returns (ce, aux, pc, recon, n_correct, n_total) or None on non-finite loss.
     pc / recon are 0.0 when their respective lambdas are 0."""
-    ta, ma, tp, mp = [x.to(device) for x in batch]
-    sig_a, fa = encode_to_signal(model, ta, ma, cfg)
-    sig_b, fb = encode_to_signal(model, tp, mp, cfg)
+    ta, ma, tp, mp = _move_batch(batch, device, cfg)
+    with _autocast(cfg, device):
+        sig_a, fa = encode_to_signal(model, ta, ma, cfg)
+        sig_b, fb = encode_to_signal(model, tp, mp, cfg)
 
-    emb_a = signal_to_embedding(sig_a, cfg)
-    emb_b = signal_to_embedding(sig_b, cfg)
-    loss_ce, logits = contrastive_loss(emb_a, emb_b, logit_scale)
+        emb_a = signal_to_embedding(sig_a, cfg)
+        emb_b = signal_to_embedding(sig_b, cfg)
+        loss_ce, logits = contrastive_loss(emb_a, emb_b, logit_scale)
 
-    fka, va = freqs_for_separation(fa, cfg, ma)
-    fkb, vb = freqs_for_separation(fb, cfg, mp)
-    aux = 0.5 * (
-        freq_separation_loss(fka, min_sep, va)
-        + freq_separation_loss(fkb, min_sep, vb)
-    )
-    pc = sig_a.new_zeros(())
-    if cfg.clip_per_channel_lambda > 0:
-        pc = _per_channel_loss(sig_a, sig_b, logit_scale, cfg)
-    recon = sig_a.new_zeros(())
-    if cfg.clip_recon_lambda > 0:
-        sa, na = reconstruction_ce_sum(model, sig_a, ta, ma)
-        sb, nb = reconstruction_ce_sum(model, sig_b, tp, mp)
-        recon = 0.5 * (sa / na + sb / nb)
+        fka, va = freqs_for_separation(fa, cfg, ma)
+        fkb, vb = freqs_for_separation(fb, cfg, mp)
+        aux = 0.5 * (
+            freq_separation_loss(fka, min_sep, va)
+            + freq_separation_loss(fkb, min_sep, vb)
+        )
+        pc = sig_a.new_zeros(())
+        if cfg.clip_per_channel_lambda > 0:
+            pc = _per_channel_loss(sig_a, sig_b, logit_scale, cfg)
+        recon = sig_a.new_zeros(())
+        if cfg.clip_recon_lambda > 0:
+            sa, na = reconstruction_ce_sum(model, sig_a, ta, ma)
+            sb, nb = reconstruction_ce_sum(model, sig_b, tp, mp)
+            recon = 0.5 * (sa / na + sb / nb)
 
-    total = (loss_ce
-             + cfg.clip_per_channel_lambda * pc
-             + cfg.freq_sep_lambda * aux
-             + cfg.clip_recon_lambda * recon)
+        total = (loss_ce
+                 + cfg.clip_per_channel_lambda * pc
+                 + cfg.freq_sep_lambda * aux
+                 + cfg.clip_recon_lambda * recon)
     if not torch.isfinite(total):
         return None
     (total / accum).backward()
@@ -337,7 +517,7 @@ def micro_step_grad_cache(model, batch, logit_scale, cfg, accum, min_sep, device
     reconstruction) and combine with the cached signal gradient via a single
     torch.autograd.backward call. Aux/recon contributions are weighted by
     chunk_size/B so the average matches direct mode."""
-    ta, ma, tp, mp = [x.to(device) for x in batch]
+    ta, ma, tp, mp = _move_batch(batch, device, cfg)
     B = ta.size(0)
 
     # Pass 1: signals only, no grad. Per-chunk RNG snapshot so pass 2 can
@@ -347,7 +527,7 @@ def micro_step_grad_cache(model, batch, logit_scale, cfg, accum, min_sep, device
     for s in range(0, B, chunk):
         e = min(B, s + chunk)
         rng_states.append(_snapshot_rng(device))
-        with torch.no_grad():
+        with torch.no_grad(), _autocast(cfg, device):
             sa, _ = encode_to_signal(model, ta[s:e], ma[s:e], cfg)
             sb, _ = encode_to_signal(model, tp[s:e], mp[s:e], cfg)
         sigs_a.append(sa)
@@ -356,13 +536,14 @@ def micro_step_grad_cache(model, batch, logit_scale, cfg, accum, min_sep, device
     SIG_A = torch.cat(sigs_a, dim=0).detach().requires_grad_(True)
     SIG_B = torch.cat(sigs_b, dim=0).detach().requires_grad_(True)
 
-    EA = signal_to_embedding(SIG_A, cfg)
-    EB = signal_to_embedding(SIG_B, cfg)
-    loss_ce, logits = contrastive_loss(EA, EB, logit_scale)
-    pc = SIG_A.new_zeros(())
-    if cfg.clip_per_channel_lambda > 0:
-        pc = _per_channel_loss(SIG_A, SIG_B, logit_scale, cfg)
-    signal_total = loss_ce + cfg.clip_per_channel_lambda * pc
+    with _autocast(cfg, device):
+        EA = signal_to_embedding(SIG_A, cfg)
+        EB = signal_to_embedding(SIG_B, cfg)
+        loss_ce, logits = contrastive_loss(EA, EB, logit_scale)
+        pc = SIG_A.new_zeros(())
+        if cfg.clip_per_channel_lambda > 0:
+            pc = _per_channel_loss(SIG_A, SIG_B, logit_scale, cfg)
+        signal_total = loss_ce + cfg.clip_per_channel_lambda * pc
     if not torch.isfinite(signal_total):
         return None
     (signal_total / accum).backward()
@@ -388,31 +569,32 @@ def micro_step_grad_cache(model, batch, logit_scale, cfg, accum, min_sep, device
     for i, s in enumerate(range(0, B, chunk)):
         e = min(B, s + chunk)
         _restore_rng(rng_states[i], device)
-        sig_a, fa = encode_to_signal(model, ta[s:e], ma[s:e], cfg)
-        sig_b, fb = encode_to_signal(model, tp[s:e], mp[s:e], cfg)
-        fka, va = freqs_for_separation(fa, cfg, ma[s:e])
-        fkb, vb = freqs_for_separation(fb, cfg, mp[s:e])
-        aux_chunk = 0.5 * (
-            freq_separation_loss(fka, min_sep, va)
-            + freq_separation_loss(fkb, min_sep, vb)
-        )
-        n_chunk = e - s
-        aux_weighted_sum += aux_chunk.item() * n_chunk
+        with _autocast(cfg, device):
+            sig_a, fa = encode_to_signal(model, ta[s:e], ma[s:e], cfg)
+            sig_b, fb = encode_to_signal(model, tp[s:e], mp[s:e], cfg)
+            fka, va = freqs_for_separation(fa, cfg, ma[s:e])
+            fkb, vb = freqs_for_separation(fb, cfg, mp[s:e])
+            aux_chunk = 0.5 * (
+                freq_separation_loss(fka, min_sep, va)
+                + freq_separation_loss(fkb, min_sep, vb)
+            )
+            n_chunk = e - s
+            aux_weighted_sum += aux_chunk.item() * n_chunk
 
-        recon_chunk = sig_a.new_zeros(())
-        if cfg.clip_recon_lambda > 0:
-            sa, _ = reconstruction_ce_sum(model, sig_a, ta[s:e], ma[s:e])
-            sb, _ = reconstruction_ce_sum(model, sig_b, tp[s:e], mp[s:e])
-            recon_chunk = 0.5 * (sa / n_a_full + sb / n_b_full)
-            recon_total += recon_chunk.item()
+            recon_chunk = sig_a.new_zeros(())
+            if cfg.clip_recon_lambda > 0:
+                sa, _ = reconstruction_ce_sum(model, sig_a, ta[s:e], ma[s:e])
+                sb, _ = reconstruction_ce_sum(model, sig_b, tp[s:e], mp[s:e])
+                recon_chunk = 0.5 * (sa / n_a_full + sb / n_b_full)
+                recon_total += recon_chunk.item()
 
-        # Aux: freq_separation_loss already averages over its batch dim, so
-        # weight by n_chunk/B. Reconstruction: recon_chunk is already a
-        # fractional contribution to the full-batch mean — no n_chunk weighting.
-        extras = (
-            cfg.freq_sep_lambda * aux_chunk * n_chunk / B
-            + cfg.clip_recon_lambda * recon_chunk
-        ) / accum
+            # Aux: freq_separation_loss already averages over its batch dim, so
+            # weight by n_chunk/B. Reconstruction: recon_chunk is already a
+            # fractional contribution to the full-batch mean — no n_chunk weighting.
+            extras = (
+                cfg.freq_sep_lambda * aux_chunk * n_chunk / B
+                + cfg.clip_recon_lambda * recon_chunk
+            ) / accum
         torch.autograd.backward(
             tensors=[sig_a, sig_b, extras],
             grad_tensors=[cached_dSIG_A[s:e], cached_dSIG_B[s:e], torch.ones_like(extras)],
@@ -424,10 +606,11 @@ def micro_step_grad_cache(model, batch, logit_scale, cfg, accum, min_sep, device
 def micro_step_direct_pooled(model, batch, logit_scale, cfg, accum, device):
     """Baseline-mode direct step: forward → pool → L2-normalize → contrastive
     loss → backward. No aux / pc / recon."""
-    ta, ma, tp, mp = [x.to(device) for x in batch]
-    emb_a = encode_to_pooled_embedding(model, ta, ma, cfg)
-    emb_b = encode_to_pooled_embedding(model, tp, mp, cfg)
-    loss_ce, logits = contrastive_loss(emb_a, emb_b, logit_scale)
+    ta, ma, tp, mp = _move_batch(batch, device, cfg)
+    with _autocast(cfg, device):
+        emb_a = encode_to_pooled_embedding(model, ta, ma, cfg)
+        emb_b = encode_to_pooled_embedding(model, tp, mp, cfg)
+        loss_ce, logits = contrastive_loss(emb_a, emb_b, logit_scale)
     if not torch.isfinite(loss_ce):
         return None
     (loss_ce / accum).backward()
@@ -441,7 +624,7 @@ def micro_step_grad_cache_pooled(model, batch, logit_scale, cfg, accum, device, 
     than the synthesized signal — same recipe as spectral mode but the cached
     tensor is (B, d_model) instead of (B, n_samples, d_sine), and there are no
     chunk-local aux / recon terms to recombine in pass 2."""
-    ta, ma, tp, mp = [x.to(device) for x in batch]
+    ta, ma, tp, mp = _move_batch(batch, device, cfg)
     B = ta.size(0)
 
     rng_states = []
@@ -449,7 +632,7 @@ def micro_step_grad_cache_pooled(model, batch, logit_scale, cfg, accum, device, 
     for s in range(0, B, chunk):
         e = min(B, s + chunk)
         rng_states.append(_snapshot_rng(device))
-        with torch.no_grad():
+        with torch.no_grad(), _autocast(cfg, device):
             ea = encode_to_pooled_embedding(model, ta[s:e], ma[s:e], cfg)
             eb = encode_to_pooled_embedding(model, tp[s:e], mp[s:e], cfg)
         embs_a.append(ea)
@@ -458,7 +641,8 @@ def micro_step_grad_cache_pooled(model, batch, logit_scale, cfg, accum, device, 
     EMB_A = torch.cat(embs_a, dim=0).detach().requires_grad_(True)
     EMB_B = torch.cat(embs_b, dim=0).detach().requires_grad_(True)
 
-    loss_ce, logits = contrastive_loss(EMB_A, EMB_B, logit_scale)
+    with _autocast(cfg, device):
+        loss_ce, logits = contrastive_loss(EMB_A, EMB_B, logit_scale)
     if not torch.isfinite(loss_ce):
         return None
     (loss_ce / accum).backward()
@@ -470,8 +654,9 @@ def micro_step_grad_cache_pooled(model, batch, logit_scale, cfg, accum, device, 
     for i, s in enumerate(range(0, B, chunk)):
         e = min(B, s + chunk)
         _restore_rng(rng_states[i], device)
-        ea = encode_to_pooled_embedding(model, ta[s:e], ma[s:e], cfg)
-        eb = encode_to_pooled_embedding(model, tp[s:e], mp[s:e], cfg)
+        with _autocast(cfg, device):
+            ea = encode_to_pooled_embedding(model, ta[s:e], ma[s:e], cfg)
+            eb = encode_to_pooled_embedding(model, tp[s:e], mp[s:e], cfg)
         torch.autograd.backward(
             tensors=[ea, eb],
             grad_tensors=[cached_dEMB_A[s:e], cached_dEMB_B[s:e]],
@@ -483,13 +668,41 @@ def train(cfg: Config, run_dir: str, resume_ckpt: str | None):
     from data_clip import make_clip_loaders
 
     device = pick_device(cfg.device)
-    print(f"[train_clip] device={device}  run_dir={run_dir}")
+    precision = configure_runtime(cfg, device)
+    if _device_type(device) == "cuda":
+        gpu = torch.cuda.get_device_name(torch.cuda.current_device())
+        capability = ".".join(map(str, torch.cuda.get_device_capability()))
+        runtime = (
+            f"precision={precision} tf32={bool(getattr(cfg, 'cuda_tf32', False))} "
+            f"gpu={gpu} sm={capability}"
+        )
+    else:
+        runtime = f"precision={precision}"
+    print(f"[train_clip] device={device} {runtime}  run_dir={run_dir}")
     torch.manual_seed(cfg.seed)
-    train_loader, val_loader = make_clip_loaders(cfg)
+    train_loader, val_loader = make_clip_loaders(cfg, device=device)
     print(
         f"[train_clip] train pairs={len(train_loader.dataset)} "
-        f"val pairs={len(val_loader.dataset)}"
+        f"val pairs={len(val_loader.dataset)}  workers={cfg.num_workers} "
+        f"pin_memory={train_loader.pin_memory}"
     )
+
+    stsb_pairs = None
+    if cfg.clip_stsb_eval:
+        from transformers import AutoTokenizer
+        from sts_eval import load_tokenized_sts
+
+        stsb_tokenizer = AutoTokenizer.from_pretrained(cfg.tokenizer_name)
+        stsb_pairs = load_tokenized_sts(
+            "mteb/stsbenchmark-sts",
+            "validation",
+            stsb_tokenizer,
+            cfg.clip_max_len,
+        )
+        print(
+            f"[train_clip] STS-B validation pairs={len(stsb_pairs)} "
+            f"batch={cfg.clip_stsb_batch_size} every={cfg.clip_val_every} steps"
+        )
 
     spectral_mode = cfg.clip_encoder_mode == "spectral"
     if not spectral_mode:
@@ -528,6 +741,9 @@ def train(cfg: Config, run_dir: str, resume_ckpt: str | None):
     cache_chunk = cfg.clip_cache_chunk_size if use_grad_cache else None
     mode = f"grad_cache(chunk={cache_chunk})" if use_grad_cache else "direct"
     extras = [f"enc={cfg.clip_encoder_mode}"]
+    if spectral_mode:
+        extras.append(f"freq={getattr(cfg, 'frequency_param_mode', 'global')}")
+        extras.append(f"channels={getattr(cfg, 'signal_channel_mode', 'multi')}")
     if spectral_mode and cfg.clip_embedding_type != "time":
         extras.append(f"emb={cfg.clip_embedding_type}")
     if cfg.clip_per_channel_lambda > 0:
@@ -547,7 +763,18 @@ def train(cfg: Config, run_dir: str, resume_ckpt: str | None):
     if use_recon:
         param_groups.append({"params": decoder_params, "weight_decay": cfg.weight_decay})
     param_groups.append({"params": [logit_scale], "weight_decay": 0.0})
-    opt = AdamW(param_groups, lr=cfg.clip_lr)
+    use_fused_opt = bool(
+        _device_type(device) == "cuda" and getattr(cfg, "fused_optimizer", False)
+    )
+    try:
+        opt = AdamW(param_groups, lr=cfg.clip_lr, fused=use_fused_opt)
+    except (TypeError, RuntimeError) as exc:
+        if not use_fused_opt:
+            raise
+        print(f"[train_clip] fused AdamW unavailable ({exc}); falling back to foreach")
+        opt = AdamW(param_groups, lr=cfg.clip_lr, foreach=True)
+        use_fused_opt = False
+    print(f"[train_clip] optimizer={'fused AdamW' if use_fused_opt else 'AdamW'}")
     sched = torch.optim.lr_scheduler.LambdaLR(opt, lr_lambda=lambda s: lr_lambda(s, cfg))
 
     step = 0
@@ -697,14 +924,40 @@ def train(cfg: Config, run_dir: str, resume_ckpt: str | None):
                 else:
                     v = validate_pooled(model, val_loader, logit_scale, device, cfg,
                                         cfg.clip_val_batches)
+                stsb = None
+                if stsb_pairs is not None:
+                    from sts_eval import evaluate_tokenized_sts
+
+                    stsb = evaluate_tokenized_sts(
+                        stsb_pairs,
+                        model,
+                        cfg,
+                        device,
+                        cfg.clip_stsb_batch_size,
+                        encode_to_embedding,
+                        autocast_context=lambda: _autocast(cfg, device),
+                    )
                 vextras = ""
                 if spectral_mode:
                     vextras += f" | aux {v['aux']:.4f}"
-                    vextras += f" | sat {v['sat']*100:.1f}% | mid {v['mid']*100:.1f}%"
+                    if getattr(cfg, "frequency_param_mode", "global") == "anchored":
+                        vextras += (
+                            f" | off-sat {v['offset_sat']*100:.1f}%"
+                            f" | boundary {v['boundary']*100:.1f}%"
+                            f" | nn {v['spacing']:.2f}Hz"
+                            f" | band {v['band_use']*100:.1f}%"
+                        )
+                    else:
+                        vextras += f" | sat {v['sat']*100:.1f}% | mid {v['mid']*100:.1f}%"
                 if cfg.clip_per_channel_lambda > 0:
                     vextras += f" | pc {v['pc']:.4f}"
                 if cfg.clip_recon_lambda > 0:
                     vextras += f" | recon {v['recon']:.4f}"
+                if stsb is not None:
+                    vextras += (
+                        f" | STS-B rho {stsb['spearman']*100:.2f}"
+                        f" r {stsb['pearson']*100:.2f}"
+                    )
                 tqdm.write(
                     f"           val: loss {v['ce']:.4f}"
                     f"{vextras} | acc {v['acc']*100:.2f}%"
@@ -715,6 +968,12 @@ def train(cfg: Config, run_dir: str, resume_ckpt: str | None):
                     aux=f"{v['aux']:.6f}", ce=f"{v['ce']:.6f}",
                     pc=f"{v['pc']:.6f}", recon=f"{v['recon']:.6f}",
                     sat=f"{v['sat']:.6f}", mid=f"{v['mid']:.6f}",
+                    offset_sat=f"{v['offset_sat']:.6f}",
+                    boundary=f"{v['boundary']:.6f}",
+                    spacing=f"{v['spacing']:.6f}",
+                    band_use=f"{v['band_use']:.6f}",
+                    stsb_spearman=(f"{stsb['spearman']:.6f}" if stsb else ""),
+                    stsb_pearson=(f"{stsb['pearson']:.6f}" if stsb else ""),
                     scale=f"{logit_scale.exp().item():.4f}",
                 )
 

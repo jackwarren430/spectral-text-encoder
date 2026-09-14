@@ -11,10 +11,10 @@ gold human similarity score (multiplied by 100, the standard convention).
 import argparse
 
 import torch
-import torch.nn.functional as F
 
-from config import Config
+from config import Config, config_from_snapshot
 from model import SpectralAE
+from sts_eval import evaluate_tokenized_sts, load_tokenized_sts
 from train_clip import encode_to_embedding, pick_device
 
 
@@ -33,63 +33,17 @@ ALL_DATASETS = [
 ]
 
 
-def encode_sentences(model, tokenizer, sentences, cfg, device, batch_size):
-    """Tokenize + encode a flat list of sentences. Returns CPU tensor (N, D)."""
-    pad_id = tokenizer.pad_token_id
-    if pad_id is None:
-        pad_id = tokenizer.eos_token_id or 0
-
-    embs = []
-    for i in range(0, len(sentences), batch_size):
-        chunk = sentences[i : i + batch_size]
-        token_lists = []
-        for s in chunk:
-            ids = tokenizer(
-                s or "",
-                add_special_tokens=False,
-                truncation=True,
-                max_length=cfg.clip_max_len,
-            )["input_ids"]
-            if not ids:
-                # STS rarely has empty strings, but guard anyway.
-                ids = [pad_id]
-            token_lists.append(ids)
-        L = max(len(t) for t in token_lists)
-        B = len(chunk)
-        tokens = torch.full((B, L), pad_id, dtype=torch.long)
-        mask = torch.ones((B, L), dtype=torch.bool)
-        for j, t in enumerate(token_lists):
-            tokens[j, : len(t)] = torch.tensor(t, dtype=torch.long)
-            mask[j, : len(t)] = False
-        tokens = tokens.to(device)
-        mask = mask.to(device)
-        with torch.no_grad():
-            emb, _ = encode_to_embedding(model, tokens, mask, cfg)
-        embs.append(emb.cpu())
-    return torch.cat(embs, dim=0)
-
-
 def evaluate_dataset(name, split, model, tokenizer, cfg, device, batch_size):
-    from datasets import load_dataset
-    from scipy.stats import pearsonr, spearmanr
-
-    ds = load_dataset(name, split=split)
-    cols = ds.column_names
-    if "sentence1" not in cols or "sentence2" not in cols:
-        raise RuntimeError(f"Unexpected columns in {name}: {cols}")
-    if "score" in cols:
-        gold = list(ds["score"])
-    elif "label" in cols:
-        gold = list(ds["label"])
-    else:
-        raise RuntimeError(f"No score/label column in {name}: {cols}")
-
-    e1 = encode_sentences(model, tokenizer, list(ds["sentence1"]), cfg, device, batch_size)
-    e2 = encode_sentences(model, tokenizer, list(ds["sentence2"]), cfg, device, batch_size)
-    cos = F.cosine_similarity(e1, e2, dim=-1).numpy()
-    rho = spearmanr(cos, gold).statistic
-    r = pearsonr(cos, gold).statistic
-    return len(gold), rho, r
+    pairs = load_tokenized_sts(name, split, tokenizer, cfg.clip_max_len)
+    result = evaluate_tokenized_sts(
+        pairs,
+        model,
+        cfg,
+        device,
+        batch_size,
+        encode_to_embedding,
+    )
+    return result["count"], result["spearman"], result["pearson"]
 
 
 def main():
@@ -102,6 +56,8 @@ def main():
                    help="Batch size for sentence encoding (default: 64)")
     p.add_argument("--embedding-type", choices=["time", "spectral"], default=None,
                    help="Override cfg.clip_embedding_type for this eval run")
+    p.add_argument("--channel-mode", choices=["multi", "sum"], default=None,
+                   help="Override the checkpoint's observable channel readout")
     args = p.parse_args()
 
     from transformers import AutoTokenizer
@@ -109,21 +65,27 @@ def main():
     device = pick_device(args.device)
     print(f"[eval] device={device}  ckpt={args.ckpt}")
     blob = torch.load(args.ckpt, map_location=device, weights_only=False)
-    cfg = Config(**blob["cfg"])
+    cfg = config_from_snapshot(blob["cfg"])
     if "sine_param_mode" not in blob["cfg"]:
-        # Checkpoints predating sine_param_mode were trained with d_sine
-        # independent (A, f, φ) triples; the current default is "shared".
+        # Checkpoints predating sine_param_mode used independent triples.
         cfg.sine_param_mode = "independent"
-    if args.embedding_type is not None:
-        cfg.clip_embedding_type = args.embedding_type
-        print(f"[eval] overriding clip_embedding_type → {cfg.clip_embedding_type}")
+    # Construct with the checkpoint's architectural config before applying
+    # readout-only overrides. This keeps an old multichannel decoder loadable
+    # during a post-hoc summed evaluation (the decoder is not used here).
     model = SpectralAE(cfg).to(device)
     model.load_state_dict(blob["model"])
     model.eval()
+    if args.embedding_type is not None:
+        cfg.clip_embedding_type = args.embedding_type
+        print(f"[eval] overriding clip_embedding_type → {cfg.clip_embedding_type}")
+    if args.channel_mode is not None:
+        cfg.signal_channel_mode = args.channel_mode
+        print(f"[eval] overriding signal_channel_mode → {cfg.signal_channel_mode}")
     tokenizer = AutoTokenizer.from_pretrained(cfg.tokenizer_name)
     step = blob.get("step", -1)
     print(f"[eval] step={step}  enc={cfg.clip_encoder_mode}  d_sine={cfg.d_sine}  "
-          f"n_samples={cfg.n_samples}  clip_max_len={cfg.clip_max_len}")
+          f"n_samples={cfg.n_samples}  channels={cfg.signal_channel_mode}  "
+          f"clip_max_len={cfg.clip_max_len}")
 
     datasets = ALL_DATASETS if args.all else DEFAULT_DATASETS
     print()

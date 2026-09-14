@@ -31,10 +31,16 @@ def lr_lambda(step, cfg: Config):
 
 
 def pick_device(requested: str) -> str:
-    if requested == "mps" and not torch.backends.mps.is_available():
+    if requested == "auto":
+        if torch.cuda.is_available():
+            return "cuda"
+        if torch.backends.mps.is_available():
+            return "mps"
         return "cpu"
-    if requested == "cuda" and not torch.cuda.is_available():
-        return "cpu"
+    if requested.startswith("mps") and not torch.backends.mps.is_available():
+        raise RuntimeError("MPS was requested but is unavailable")
+    if requested.startswith("cuda") and not torch.cuda.is_available():
+        raise RuntimeError("CUDA was requested but is unavailable")
     return requested
 
 

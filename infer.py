@@ -4,8 +4,8 @@ import os
 import torch
 from transformers import AutoTokenizer
 
-from config import Config
-from model import SpectralAE, synthesize
+from config import Config, config_from_snapshot
+from model import SpectralAE, combine_signal_channels, synthesize
 
 
 # Fixed 64-token sample (GPT-2 BPE) for consistent qualitative inspection
@@ -30,7 +30,7 @@ def pick_device(requested: str) -> str:
 
 def load_model(ckpt_path: str, device: str):
     blob = torch.load(ckpt_path, map_location=device, weights_only=False)
-    cfg = Config(**blob["cfg"])
+    cfg = config_from_snapshot(blob["cfg"])
     model = SpectralAE(cfg).to(device)
     model.load_state_dict(blob["model"])
     model.eval()
@@ -87,6 +87,7 @@ def run(ckpt_path: str, text: str, device: str, plot_path: str | None):
         # for a single sample; avoids threading an extra return through the model.
         A, f, phi = model.encoder(tokens)
         signal = synthesize(A, f, phi, cfg.n_samples, cfg.duration)
+        signal = combine_signal_channels(signal, cfg)
     pred_ids = logits.argmax(-1)  # (1, L)
 
     correct = (pred_ids == targets).sum().item()

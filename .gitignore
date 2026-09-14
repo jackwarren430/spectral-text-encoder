@@ -2,5 +2,9 @@
 /all-training
 /visualizations
 /pace-ice-runs
+.venv/
+__pycache__/
 *.pyc
 *.pt
+.DS_Store
+.cache/triton/
